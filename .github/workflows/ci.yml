@@ -11,20 +11,20 @@ permissions:
 
 jobs:
   verify:
-    name: Verify (Python ${{ matrix.python-version }})
+    name: Verify (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # macOS is included deliberately: the Seatbelt driver is macOS-only, and a matrix that
         # never runs it is a driver nobody has verified.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
         python-version: ["3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -60,11 +60,11 @@ jobs:
 
   release-diagnostics:
     name: Development release diagnostics
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: verify
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: |
@@ -80,10 +80,10 @@ jobs:
 
   package:
     name: Build the wheel
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: |
@@ -99,7 +99,8 @@ jobs:
           /tmp/verify/bin/daedalus init --path /tmp/verify/daedalus.toml --workspace /tmp/verify/ws
           /tmp/verify/bin/daedalus config --config /tmp/verify/daedalus.toml >/dev/null
           /tmp/verify/bin/daedalus preflight --workspace /tmp/verify/ws || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: daedalus-wheel
           path: dist/*.whl
+
