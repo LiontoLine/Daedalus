@@ -1,0 +1,71 @@
+<section class="panel panel-lead" id="intake-step-task">
+  <header class="panel-head">
+    <div>
+      <h2>从一个目标开始</h2>
+      <p class="panel-sub">描述目标、选择仓库。确认需求后，下方会生成执行计划。</p>
+    </div>
+  </header>
+
+  <div id="intake-error" class="alert" hidden></div>
+
+  <div class="intake-task">
+    <label class="intake-objective">
+      <span class="intake-label">任务</span>
+      <textarea id="intake-objective" rows="3"
+        placeholder="例：把 summarize() 的字数统计改成按空白切分，并保留空输入返回 0"></textarea>
+    </label>
+
+    <div class="prompt-examples" aria-label="目标示例"><span class="muted">试着从这里开始</span><button type="button" class="ghost small" data-objective="修复一个已知问题，并添加覆盖边界情况的回归测试。">修复问题</button><button type="button" class="ghost small" data-objective="为现有功能补充单元测试，覆盖正常输入、空输入和异常情况。">补充测试</button><button type="button" class="ghost small" data-objective="梳理项目的安装与启动步骤，完善 README，并验证示例命令。">完善文档</button></div>
+    <div class="intake-repo">
+      <span class="intake-label">仓库</span>
+      <div id="intake-repos" class="repo-cards"></div>
+      <button type="button" class="ghost small" id="intake-other-repo">其他路径…</button>
+      <input id="intake-repo-path" class="hidden" placeholder="/absolute/path/to/repo" />
+    </div>
+
+    <div class="intake-model-connection"><span id="workflow-model-label">尚未读取模型连接</span><button type="button" class="ghost small" data-model-open>导入 / 设置模型</button></div>
+    <div class="intake-go">
+      <button type="button" id="intake-start" class="primary">分析任务 →</button>
+      <span class="muted" id="intake-model-note"></span>
+    </div>
+  </div>
+</section>
+
+<section class="panel" id="intake-step-questions" hidden>
+  <header class="panel-head">
+    <div>
+      <h2 id="intake-question-title">模型的问题</h2>
+      <p class="panel-sub" id="intake-question-sub"></p>
+    </div>
+    <div class="controls">
+      <button type="button" class="ghost small" id="intake-back">← 上一题</button>
+      <button type="button" class="ghost small" id="intake-skip">跳过这一题</button>
+    </div>
+  </header>
+
+  <div class="intake-progress" id="intake-progress"></div>
+  <div class="intake-question" id="intake-question"></div>
+  <div class="intake-options" id="intake-options"></div>
+
+  <details class="disclose" id="intake-free-wrap" hidden>
+    <summary>自己写一个答案</summary>
+    <div class="intake-free">
+      <input id="intake-free-text" placeholder="按该字段的格式写；多个值用英文逗号分隔" />
+      <button type="button" class="ghost" id="intake-free-submit">用这个答案</button>
+    </div>
+  </details>
+
+  <div id="intake-rejections" class="intake-note" hidden></div>
+</section>
+
+
+
+<section class="panel" id="intake-step-recent" hidden>
+  <header class="panel-head">
+    <div>
+      <h2>最近的任务</h2>
+      <p class="panel-sub">继续未完成的需求确认，或打开已经创建的任务。</p>
+    </div>
+  </header>
+  <div id="intake-recent"></div>
+</section>

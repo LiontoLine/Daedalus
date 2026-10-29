@@ -1,0 +1,21 @@
+<dialog id="service-dialog" class="model-dialog" aria-labelledby="service-title">
+  <section class="model-settings">
+    <header class="model-dialog-head"><div><span class="eyebrow">SERVICE &amp; RECOVERY</span><h2 id="service-title">服务与恢复</h2><p class="muted">保存断点 → 关闭 / 重启 → 仅提醒 → 人工审查 → 继续执行</p></div><button type="button" class="ghost" id="service-close" aria-label="关闭服务面板">✕</button></header>
+    <div class="model-dialog-body">
+      <p id="service-summary" class="muted">正在读取服务状态…</p>
+      <label class="field">下次开启时的提醒备注（可选）<textarea id="service-stop-note" rows="2" maxlength="2000" placeholder="例如：升级后检查已提交节点，再决定是否继续"></textarea></label>
+      <div class="model-actions"><button type="button" class="ghost" id="service-restart" disabled>保存断点并重启</button><button type="button" class="ghost danger" id="service-stop" disabled>保存断点并关闭</button></div>
+      <p class="muted model-caveat">停止会等待当前步骤批次完成，保留已验证提交，禁止接收新任务。关闭后在终端运行 daedalus，或在已有控制台输入 /start 重新开启。</p>
+      <h3>待人工审查的中断任务</h3><div id="service-reminders"></div>
+      <section id="recovery-review-panel" hidden>
+        <h3>恢复节点审查</h3><div id="recovery-checkpoint"></div>
+        <label class="field">审查者<input id="recovery-reviewer" autocomplete="off" placeholder="填写你的姓名或已登记身份" /></label>
+        <label class="field">审查备注<textarea id="recovery-review-note" rows="2" maxlength="2000" placeholder="核对最近已验证提交与待续节点，说明继续执行的依据"></textarea></label>
+        <details><summary>已启用身份核验的工作区</summary><label class="field">签名<input id="recovery-signature" type="password" autocomplete="new-password" /></label><p class="muted">签名绑定本次恢复节点摘要；原有规格、门禁和高风险审批仍然生效。</p><code id="recovery-claim"></code></details>
+        <label class="switch model-ack"><input id="recovery-confirm" type="checkbox" /><span>我已审查当前断点与待续节点，同意从此处继续。</span></label>
+        <div class="model-actions"><button type="button" class="ghost" id="recovery-save-review">仅保存审查备注</button><button type="button" class="primary" id="recovery-resume">审查并继续任务</button></div>
+      </section>
+      <p id="service-out" class="callout" role="status" aria-live="polite" hidden></p>
+    </div>
+  </section>
+</dialog>

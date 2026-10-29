@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Daedalus · 任务全流程{% endblock %}
+{% block content %}
+<div class="workflow-shell">
+  <header class="workflow-heading">
+    <div><span class="eyebrow">DAEDALUS / 从目标到交付</span><h1 id="workflow-title">把目标变成可验收的结果</h1><p id="workflow-subtitle" class="muted">提交需求，确认规划，查看执行，再对照目标审计。所有步骤都在这里。</p><div id="run-note" class="run-note muted"></div></div>
+    <div class="workflow-controls"><label class="field">当前任务<select id="run-picker" aria-label="当前任务"><option value="">＋ 新建任务</option></select></label><button type="button" id="workflow-new" class="ghost">＋ 新建任务</button><label class="live-switch"><input id="auto-refresh" type="checkbox" checked /><span class="live-dot"></span>实时</label><button type="button" id="refresh" class="ghost icon-button" aria-label="刷新任务" title="刷新">↻</button></div>
+  </header>
+  <nav class="workflow-progress" aria-label="任务完整流程">
+    <a href="#flow-task" data-flow-link="task" aria-current="step"><span class="flow-number">01</span><span><strong>提交任务</strong><small data-flow-status="task">描述目标</small></span><span class="flow-check" aria-hidden="true">✓</span></a><span class="flow-arrow" aria-hidden="true">→</span>
+    <a href="#flow-plan" data-flow-link="plan"><span class="flow-number">02</span><span><strong>产出规划</strong><small data-flow-status="plan">拆解步骤与验收</small></span><span class="flow-check" aria-hidden="true">✓</span></a><span class="flow-arrow" aria-hidden="true">→</span>
+    <a href="#flow-execute" data-flow-link="execute"><span class="flow-number">03</span><span><strong>执行任务</strong><small data-flow-status="execute">DAG 与节点进度</small></span><span class="flow-check" aria-hidden="true">✓</span></a><span class="flow-arrow" aria-hidden="true">→</span>
+    <a href="#flow-audit" data-flow-link="audit"><span class="flow-number">04</span><span><strong>审计与改进</strong><small data-flow-status="audit">核对目标与交付</small></span><span class="flow-check" aria-hidden="true">✓</span></a>
+    <div class="workflow-next"><span id="workflow-loop-hint">↺ 目标偏离后，按反馈进入下一轮执行 · 含首次最多 3 轮</span><a id="workflow-next" href="#flow-task">从描述目标开始 ↓</a></div>
+  </nav>
+  <div id="workflow-error" class="alert" role="status" hidden></div>
+  <section id="flow-task" class="flow-section" aria-labelledby="flow-task-title">
+    <header class="flow-section-head"><span class="flow-section-number">01</span><div><h2 id="flow-task-title">提交任务</h2><p>明确要完成什么，以及在哪个项目中完成。</p></div><span class="flow-section-state" data-flow-status="task">描述目标</span></header>
+    <div id="workflow-submitted" class="panel" hidden></div>
+    <div id="workflow-create">{% include "_workflow_intake.html" %}</div>
+  </section>
+  <section id="flow-plan" class="flow-section" aria-labelledby="flow-plan-title">
+    <header class="flow-section-head"><span class="flow-section-number">02</span><div><h2 id="flow-plan-title">产出规划</h2><p>先确认执行步骤、验收标准和改动范围，再开始执行。</p></div><span class="flow-section-state" data-flow-status="plan">等待需求</span></header>
+    {% include "_workflow_knowledge.html" %}
+    <div id="workflow-plan-empty" class="workflow-placeholder"><span>◇</span><div><strong>任务明确后，规划会出现在这里</strong><p>查看每一步的目标、依赖与预期产物，然后确认执行。</p></div></div>
+    <div id="workflow-draft-plan" hidden>{% include "_workflow_review.html" %}</div>
+    <div id="workflow-frozen-plan" hidden><div id="planning-error" class="alert" hidden></div><div id="plan-summary" class="summary-strip"></div>{% include "_workflow_plan.html" %}</div>
+  </section>
+  <section id="flow-execute" class="flow-section" aria-labelledby="flow-execute-title">
+    <header class="flow-section-head"><span class="flow-section-number">03</span><div><h2 id="flow-execute-title">执行任务</h2><p>实时跟踪依赖与节点进度，点击步骤查看总览、改动和门禁。</p></div><span class="flow-section-state" data-flow-status="execute">等待确认规划</span></header>
+    <div id="workflow-execute-empty" class="workflow-placeholder"><span>⌘</span><div><strong>确认规划后，在这里查看执行图</strong><p>每一步的进度、产物与需要处理的事项会持续更新。</p></div></div>
+    <div id="workflow-execution" hidden>{% include "_workflow_execution.html" %}</div>
+  </section>
+  <section id="flow-audit" class="flow-section" aria-labelledby="flow-audit-title">
+    <header class="flow-section-head"><span class="flow-section-number">04</span><div><h2 id="flow-audit-title">审计与改进</h2><p>同时核对合规与本次目标。偏离目标时带着反馈进入下一轮。</p></div><div class="controls"><span class="flow-section-state" data-flow-status="audit">等待执行结果</span><a class="button ghost small" id="export-jsonl" href="#" download>导出记录</a><a class="button ghost small" id="export-csv" href="#" download>CSV</a></div></header>
+    <div id="workflow-audit-empty" class="workflow-placeholder"><span>◎</span><div><strong>执行证据与目标结论会汇集在这里</strong><p>审计不会只看合规；这里也会展示目标是否达成及改进轮次。</p></div></div>
+    <div id="workflow-audit" hidden><div id="audit-error" class="alert" hidden></div><div id="audit-summary" class="summary-strip"></div><div id="workflow-loop" class="panel workflow-loop" aria-live="polite"></div>{% include "_workflow_audit.html" %}</div>
+    {% include "_engineering_evaluation.html" %}
+    {% include "_review_evaluation.html" %}
+  </section>
+</div>
+{% endblock %}

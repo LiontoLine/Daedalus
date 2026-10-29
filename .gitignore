@@ -1,0 +1,87 @@
+# Python and build products
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Credentials and machine-specific configuration
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+.npmrc
+/daedalus.toml
+*.local.toml
+*.local.json
+/.idea/
+/.vscode/
+
+# Runtime state, logs and model settings — never publish
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+worktrees/
+runs/
+scratch/
+.model-settings/
+.service/
+/.daedalus/
+/workspace/
+/state/
+
+# Private research, personal material, upstream data and local tooling
+/paper/
+/archive/
+/external_data/
+/scripts/maintenance/
+
+# Public documentation is an explicit allowlist.
+# Review a new document for credentials and personal data before adding it here.
+/docs/*
+!/docs/README.md
+!/docs/architecture.md
+!/docs/design-decisions.md
+!/docs/runbook.md
+!/docs/service-control.md
+!/docs/model-settings.md
+!/docs/model-credential-storage.md
+!/docs/agentic-rag.md
+!/docs/retrieval-strategy.md
+!/docs/dependency-integrity.md
+!/docs/ui-workspace.md
+!/docs/agentpanelx-reuse.md
+!/docs/roadmap.md
+!/docs/publishing.md
+
+# Local release bundles and review output
+/public-release/
+/release-audit/
+/daedalus-github*.zip
+
+# OS metadata
+.DS_Store
+._*
+Thumbs.db

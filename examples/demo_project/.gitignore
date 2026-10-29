@@ -1,0 +1,7 @@
+# Test and build side effects must never become part of a commit. Without this, running
+# the acceptance tests writes __pycache__ into the worktree and the tree that gets
+# committed stops being the tree the gate actually reviewed.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/

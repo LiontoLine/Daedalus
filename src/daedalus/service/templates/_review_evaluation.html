@@ -1,0 +1,9 @@
+<details class="panel" id="review-evaluation-panel">
+  <summary>审查上下文复验 · 有 / 无依赖上下文对照</summary>
+  <p class="muted">20个固定候选，40项配对审查。独立测试先建立正确性标签，再由已保存的 reviewer 审查。结果仅代表审查组件，不代表整体编码能力。</p>
+  <p class="muted">真实调用上限48次、报告用量100,000 tokens；用量未知即停止后续派发。重启后仅提醒，不自动继续。</p>
+  <div class="controls"><button type="button" id="review-evaluation-start">运行40项真实审查</button><button type="button" id="review-evaluation-refresh" class="ghost">刷新结果</button><button type="button" id="review-evaluation-cancel" class="ghost" hidden>停止后续调用</button></div>
+  <p id="review-evaluation-status" role="status">尚未加载</p>
+  <div id="review-evaluation-result" class="table-scroll"></div>
+</details>
+<script defer src="/static/review-evaluation.js"></script>

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}Daedalus{% endblock %}</title>
+  {# Everything is served from this process: no CDN, so the console works on a machine that is
+     deliberately offline, and `pip install` remains the only install step. The vendored files
+     are pinned by digest in static/vendor/MANIFEST.json. #}
+  <link rel="stylesheet" href="/static/vendor/diff2html.min.css" />
+  <link rel="stylesheet" href="/static/console.css?v=lifecycle-20261024-1" />
+  <link rel="stylesheet" href="/static/engineering.css?v=20261027-3" />
+</head>
+<body data-page="{{ 'workflow' if page in ['intake', 'planning', 'execution', 'audit', 'workflow'] else page }}" data-initial-stage="{{ {'planning': 'plan', 'execution': 'execute', 'audit': 'audit'}.get(page, 'task') }}"{% if run_id %} data-run-id="{{ run_id }}"{% endif %}>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">D</span>
+      <div class="brand-text">
+        <strong>Daedalus</strong>
+        <span class="muted">项目交付工作台</span>
+      </div>
+    </div>
+    <nav aria-label="主导航">
+      <a href="/" class="{{ 'active' if page in ['intake', 'planning', 'execution', 'audit', 'workflow'] else '' }}">任务工作流 <span id="escalation-badge" class="badge" hidden>0</span></a>
+      <a href="/runs" class="{{ 'active' if page == 'board' else '' }}">全部任务</a>
+      <a href="/operations" class="{{ 'active' if page == 'operations' else '' }}">运行环境 <span id="alert-badge" class="badge" hidden>0</span></a>
+    </nav>
+    <div class="meta">
+      <button type="button" class="ghost small model-open-button" data-model-open>模型设置 <span id="model-top-status" class="model-top-status">配置连接</span></button>
+      <button type="button" class="ghost small" data-service-open>服务</button>
+      <a href="/auth/setup" class="button ghost small">访问设置</a>
+      <span class="muted" id="health">v{{ version }}</span>
+    </div>
+  </header>
+
+  <main>
+    {% if service_lifecycle and (service_lifecycle.reminders or service_lifecycle.previous_session.note) %}
+    <aside class="restart-reminder" role="status"><div><strong>上次会话提醒</strong><p>{{ service_lifecycle.previous_session.note or '有尚未完成的任务' }} · 已保留执行记录，未自动恢复任务。{% if service_lifecycle.previous_session.model_connections_need_reentry %} 网页临时模型连接需要重新配置。{% endif %}</p></div><button type="button" class="ghost small" data-service-open>查看断点并人工审查</button></aside>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  {% include "_model_settings.html" %}
+  {% include "_service_control.html" %}
+
+  <footer class="muted">
+    Daedalus · <code>{{ workspace }}</code>
+  </footer>
+
+  <script src="/static/vendor/diff2html.min.js"></script>
+  <script src="/static/console.js?v=lifecycle-20261024-1"></script>
+  <script src="/static/engineering.js?v=20261027-4"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

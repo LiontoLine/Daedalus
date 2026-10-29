@@ -1,0 +1,225 @@
+{
+  "version": 1,
+  "updated_at": "2026-10-24",
+  "formats": [
+    {
+      "id": "openai_chat",
+      "name": "OpenAI Chat Completions（兼容）"
+    },
+    {
+      "id": "openai_responses",
+      "name": "OpenAI Responses"
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic Messages（Claude）"
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini（原生）"
+    }
+  ],
+  "providers": [
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "group": "国际",
+      "api_format": "openai_responses",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "docs_url": "https://developers.openai.com/api/docs/guides/text",
+      "hint": "支持 Responses；也可切换 Chat Completions。"
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic / Claude",
+      "group": "国际",
+      "api_format": "anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "docs_url": "https://platform.claude.com/docs/en/build-with-claude/working-with-messages",
+      "hint": "Claude 原生 Messages 协议。"
+    },
+    {
+      "id": "gemini",
+      "name": "Google / Gemini",
+      "group": "国际",
+      "api_format": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "api_key_env": "GEMINI_API_KEY",
+      "docs_url": "https://ai.google.dev/api/generate-content",
+      "hint": "Gemini 原生协议；模型 ID 可从列表获取。"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://api.deepseek.com",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "docs_url": "https://api-docs.deepseek.com/",
+      "hint": "使用账户当前可用的模型 ID。"
+    },
+    {
+      "id": "qwen",
+      "name": "阿里云百炼 / 通义千问",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "api_key_env": "DASHSCOPE_API_KEY",
+      "docs_url": "https://help.aliyun.com/en/model-studio/base-url",
+      "hint": "区域与工作空间端点可能不同，请以百炼控制台为准。"
+    },
+    {
+      "id": "moonshot",
+      "name": "Moonshot / Kimi",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://api.moonshot.cn/v1",
+      "api_key_env": "MOONSHOT_API_KEY",
+      "docs_url": "https://platform.moonshot.cn/docs",
+      "hint": "国际站可改为 https://api.moonshot.ai/v1。"
+    },
+    {
+      "id": "zhipu",
+      "name": "智谱 / GLM",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "api_key_env": "ZHIPU_API_KEY",
+      "docs_url": "https://docs.bigmodel.cn/cn/api/introduction",
+      "hint": "编程套餐须填写其专用地址。"
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://api.minimaxi.com/v1",
+      "api_key_env": "MINIMAX_API_KEY",
+      "docs_url": "https://platform.minimaxi.com/docs/api-reference/text-openai-api",
+      "hint": "国际站可改为 https://api.minimax.io/v1。"
+    },
+    {
+      "id": "doubao",
+      "name": "火山方舟 / 豆包",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key_env": "ARK_API_KEY",
+      "docs_url": "https://www.volcengine.com/docs/82379",
+      "hint": "填写模型 ID 或已开通的 Endpoint ID。"
+    },
+    {
+      "id": "hunyuan",
+      "name": "腾讯混元",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
+      "api_key_env": "HUNYUAN_API_KEY",
+      "docs_url": "https://cloud.tencent.com/document/product/1729/111007",
+      "hint": "新购服务可使用 TokenHub，填写其控制台地址。"
+    },
+    {
+      "id": "qianfan",
+      "name": "百度千帆 / 文心",
+      "group": "国内",
+      "api_format": "openai_chat",
+      "base_url": "https://qianfan.baidubce.com/v2",
+      "api_key_env": "QIANFAN_API_KEY",
+      "docs_url": "https://cloud.baidu.com/doc/qianfan-api",
+      "hint": "使用 API Key，不是旧版 Access Key / Secret Key。"
+    },
+    {
+      "id": "siliconflow",
+      "name": "硅基流动",
+      "group": "聚合",
+      "api_format": "openai_chat",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "api_key_env": "SILICONFLOW_API_KEY",
+      "docs_url": "https://docs.siliconflow.cn/cn/api-reference/chat-completions/chat-completions",
+      "hint": "填写完整的组织 / 模型 ID。"
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "group": "聚合",
+      "api_format": "openai_chat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "docs_url": "https://openrouter.ai/docs/quickstart",
+      "hint": "按账户权限接入多厂商文本模型。"
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "group": "国际",
+      "api_format": "openai_chat",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_env": "GROQ_API_KEY",
+      "docs_url": "https://console.groq.com/docs/openai",
+      "hint": "使用账户可用的模型 ID。"
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral",
+      "group": "国际",
+      "api_format": "openai_chat",
+      "base_url": "https://api.mistral.ai/v1",
+      "api_key_env": "MISTRAL_API_KEY",
+      "docs_url": "https://docs.mistral.ai/api",
+      "hint": "使用 Mistral 文本对话模型。"
+    },
+    {
+      "id": "xai",
+      "name": "xAI / Grok",
+      "group": "国际",
+      "api_format": "openai_chat",
+      "base_url": "https://api.x.ai/v1",
+      "api_key_env": "XAI_API_KEY",
+      "docs_url": "https://docs.x.ai/docs/overview",
+      "hint": "使用账户可用的 Grok 模型 ID。"
+    },
+    {
+      "id": "azure",
+      "name": "Azure OpenAI",
+      "group": "国际",
+      "api_format": "openai_responses",
+      "base_url": "",
+      "api_key_env": "AZURE_OPENAI_API_KEY",
+      "request_options": {"auth_mode": "api-key"},
+      "docs_url": "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/api-version-lifecycle",
+      "hint": "填写 https://资源名.openai.azure.com/openai/v1 和模型部署名。"
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama",
+      "group": "本地",
+      "api_format": "openai_chat",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "api_key_env": "",
+      "docs_url": "https://docs.ollama.com/openai",
+      "hint": "先在 Ollama 下载模型；本机通常无需密钥。"
+    },
+    {
+      "id": "lmstudio",
+      "name": "LM Studio",
+      "group": "本地",
+      "api_format": "openai_chat",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "api_key_env": "",
+      "docs_url": "https://lmstudio.ai/docs/developer/openai-compat",
+      "hint": "先启用本地 API 服务。"
+    },
+    {
+      "id": "custom",
+      "name": "自定义 / vLLM / 兼容网关",
+      "group": "自定义",
+      "api_format": "openai_chat",
+      "base_url": "",
+      "api_key_env": "DAEDALUS_MODEL_API_KEY",
+      "docs_url": "https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html",
+      "hint": "地址、模型 ID 与协议均可自行配置。"
+    }
+  ]
+}

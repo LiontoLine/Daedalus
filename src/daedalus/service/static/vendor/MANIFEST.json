@@ -1,0 +1,32 @@
+{
+  "assets": [
+    {
+      "file": "diff2html.min.js",
+      "licence": "MIT",
+      "name": "diff2html",
+      "purpose": "renders the audit module's unified diffs with line numbers and a file list",
+      "sha256": "c59a1ab80bc913ae5db094d0a4274b56bf9a94245f30819be071075ae298580b",
+      "url": "https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js",
+      "version": "3.4.48"
+    },
+    {
+      "file": "diff2html.min.css",
+      "licence": "MIT",
+      "name": "diff2html",
+      "purpose": "diff2html's layout and colour rules",
+      "sha256": "20c04ae15359a748afc1e7d29f9d5bb3076cae19341e83132dcd86a851c50578",
+      "url": "https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css",
+      "version": "3.4.48"
+    },
+    {
+      "file": "inter-latin.woff2",
+      "licence": "OFL-1.1",
+      "name": "@fontsource-variable/inter",
+      "purpose": "UI typeface for Latin text and numerals; CJK falls back to the system font",
+      "sha256": "88df0b5a7bc397dbc13a26bb8b3742cc62cd1c9b0dded57da7832416d6f52f42",
+      "url": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.0.18/files/inter-latin-wght-normal.woff2",
+      "version": "5.0.18"
+    }
+  ],
+  "note": "Third-party front-end assets, vendored so the console loads nothing from the network at runtime. `tests/test_console_assets.py` recomputes every digest and fails if a file changes, so replacing one of these is a visible act rather than a silent one."
+}

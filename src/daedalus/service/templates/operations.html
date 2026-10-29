@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Daedalus · 运维详情{% endblock %}
+{% block content %}
+<div class="journey"><a href="/audit">← 返回审计</a><span>系统运行状况</span></div>
+<section class="panel">
+  <header class="panel-head"><h2>健康</h2></header>
+  <dl class="kv" id="health-kv"><p class="muted">加载中…</p></dl>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>配置</h2>
+    <span class="muted">优先级：默认值 &lt; 配置文件 &lt; DAEDALUS_* 环境变量 &lt; 显式参数</span></header>
+  <details class="secondary-details"><summary>查看生效配置</summary><pre id="config" class="code">加载中…</pre></details>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>告警</h2>
+    <span class="muted">从持久化证据评估；规则只读，不写任何状态</span></header>
+  <div id="alerts-out" class="muted">评估中…</div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>实际生效的隔离</h2>
+    <span class="muted">探测得到，不是假设——缺口会一并列出</span></header>
+  <div id="isolation-out" class="muted">探测中…</div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>Spec 签批控制（§3.2）</h2>
+    <span class="muted">签名、owner 身份与权限——报告的是配置成什么样，不是打算成什么样</span></header>
+  <div id="identity-out" class="muted">加载中…</div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>Executions（§19）</h2>
+    <span class="muted">一次有界执行一行；重放会指明它的父 execution</span></header>
+  <table class="table" id="executions">
+    <thead><tr><th>Execution</th><th>Run</th><th>类型</th><th>状态</th><th>步骤</th><th>开始</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>Workers（§19）</h2>
+    <span class="muted">谁执行了这些工作，产出了什么</span></header>
+  <table class="table" id="workers">
+    <thead><tr><th>Worker</th><th>类型</th><th>状态</th><th>启动</th><th>已提交</th><th>失败</th><th>最近心跳</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>故障修复</h2>
+    <span class="muted">先报告；只修簿记，不造事实</span></header>
+  <div class="controls">
+    <button id="recover-dry" class="ghost">只检查</button>
+    <button id="recover-apply">执行修复</button>
+  </div>
+  <div id="recover-out" class="muted">尚未运行</div>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>备份</h2>
+    <span class="muted">每个快照在报告之前都先校验过</span></header>
+  <div class="controls">
+    <input id="backup-label" placeholder="标签（可选）" />
+    <button id="backup-create">创建快照</button>
+  </div>
+  <div id="backup-out" class="muted">本次会话还没有创建快照</div>
+  <table class="table" id="backups">
+    <thead><tr><th>路径</th><th>事件数</th><th>完整性</th><th>创建时间</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <header class="panel-head"><h2>指标</h2>
+    <span class="muted">先是比率，然后是原始投影</span></header>
+  <div id="metrics-bars" class="metrics-bars"></div>
+  <details class="secondary-details"><summary>原始指标</summary><pre id="metrics" class="code">加载中…</pre></details>
+</section>
+{% endblock %}

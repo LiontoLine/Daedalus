@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Daedalus · 待人工处置{% endblock %}
+{% block content %}
+<div class="journey"><a href="/execution">← 返回工作台</a><span>查看原因，确认后继续执行</span></div>
+<section class="panel">
+  <header class="panel-head">
+    <h2>待处理事项</h2>
+    <div class="controls">
+      <label class="check"><input type="checkbox" id="auto-refresh" checked /> 实时</label>
+      <button id="refresh" class="ghost">刷新</button>
+    </div>
+  </header>
+  <div id="esk-error" class="alert" hidden></div>
+  <div id="escalations"><p class="muted">加载中…</p></div>
+</section>
+{% endblock %}

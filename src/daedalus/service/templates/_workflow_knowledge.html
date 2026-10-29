@@ -1,0 +1,28 @@
+<details id="knowledge-panel" class="panel secondary-details">
+  <summary>项目记忆与决策依据 <span class="muted">资料 · 已确认偏好 · 检索引用</span></summary>
+  <p class="muted">简单定位使用代码直接搜索；跨文件调查或失败回归才进入证据检索循环。偏好由你确认保存，任务要求与验收标准优先。</p>
+  <div id="knowledge-error" class="alert" role="status" hidden></div>
+  <label class="field">项目路径<input id="knowledge-repo" placeholder="选择项目后自动填入，也可输入 Git 仓库路径" /></label>
+  <div class="actions"><button type="button" id="knowledge-load" class="ghost small">读取项目记忆</button><span id="knowledge-summary" class="muted" aria-live="polite"></span></div>
+  <details class="secondary-details"><summary>本地语义检索与索引</summary>
+    <p id="knowledge-retrieval-status" class="muted" aria-live="polite">读取项目后显示准备状态</p>
+    <div class="actions"><button type="button" id="knowledge-retrieval-setup" class="ghost small">准备并启用本地语义检索</button><button type="button" id="knowledge-retrieval-index" class="ghost small">更新此项目索引</button><button type="button" id="knowledge-retrieval-disable" class="ghost small">关闭语义检索</button></div>
+    <p class="muted">准备会下载约 220 MB 的多语言模型；文本向量在本机生成。日常任务不会自动下载。简单任务继续直接搜索。</p>
+    <details id="knowledge-retrieval-install" hidden><summary>安装本地检索依赖</summary><p>在项目目录执行：<code>.venv/bin/python -m pip install -e '.[retrieval]'</code>，再点击准备。无需新增模型 API Key。</p></details>
+    <output id="knowledge-index-result" class="muted" aria-live="polite"></output>
+  </details>
+  <div class="two-col">
+    <div><h3 class="section-title">资料与偏好</h3><div id="knowledge-records"><p class="empty">读取项目后查看</p></div>
+      <form id="knowledge-form">
+        <label class="field">保存类型<select name="kind"><option value="preference">我的项目偏好</option><option value="document">项目参考资料</option></select></label>
+        <label class="field">标题<input name="title" required maxlength="160" placeholder="例如：优先修复回归，再扩展功能" /></label>
+        <label class="field">内容<textarea name="text" required maxlength="24000" rows="4" placeholder="保存你希望后续规划参考的信息"></textarea></label>
+        <label class="field">或导入 Markdown / 文本<input id="knowledge-file" type="file" accept=".md,.txt,text/plain,text/markdown" /></label>
+        <button type="submit" class="primary">确认保存到此项目</button>
+      </form>
+    </div>
+    <div><h3 class="section-title">最近搜索与决策依据</h3><div id="knowledge-traces"><p class="empty">显示采用的搜索路径、工具动作与实际来源</p></div>
+      <form id="knowledge-search-form"><label class="field">试查资料<input name="query" required maxlength="1000" placeholder="例如：函数名、测试失败、接口约定" /></label><label class="field">搜索方式<select name="mode"><option value="auto">自动选择</option><option value="grep">代码直接搜索</option><option value="lexical">项目资料词法检索</option><option value="hybrid">混合召回与排序</option><option value="deep">深入调查与上下文追踪</option></select></label><label><input type="checkbox" name="use_model" /> 允许使用已配置模型进行调查与精排</label><button type="submit" class="ghost small">试查证据</button><p class="muted">默认不调用生成模型。允许模型后，精排和调查会计入模型用量；不会启动或批准任务。</p></form>
+    </div>
+  </div>
+</details>

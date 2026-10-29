@@ -1,0 +1,22 @@
+<details class="panel engineering-panel" id="engineering-eval">
+  <summary><strong>能力验收</strong><span class="muted">同一模型 · 三种工作方式 · 可复核的工程任务</span></summary>
+  <p class="panel-sub">对照一次性模型、读码与测试循环的经典 Agent，以及 Daedalus。安全交付需同时通过公开测试、隐藏验收和改动范围检查。</p>
+  <div id="engineering-cases" class="engineering-cases" aria-label="选择验收任务"></div>
+  <div class="controls engineering-controls">
+    <button type="button" id="engineering-start">运行真实对照</button>
+    <button type="button" class="ghost" id="engineering-cancel" disabled>停止本批</button>
+    <button type="button" class="ghost" id="engineering-refresh">刷新结果</button>
+    <select id="engineering-history" aria-label="查看实验记录"><option value="">选择已有实验</option></select>
+  </div>
+  <div class="engineering-cases">
+    <label>新实验模式 <select id="engineering-profile"><option value="configured">保持模型设置</option><option value="bounded_json">结构化动作（官方 DeepSeek）</option></select></label>
+    <label>新实验 tokens <input id="engineering-token-limit" type="number" min="10000" max="300000" value="300000"></label>
+    <label>新实验调用上限 <input id="engineering-call-limit" type="number" min="1" max="144" value="144"></label>
+  </div>
+  <p class="muted">使用已配置的编码模型，会产生接口用量。每组最多 8 次调用、30,000 tokens；本批采用上方限制。估算与未知用量不等同于账单上限。停止会等待当前请求结算，不再派发后续请求。</p>
+  <div id="engineering-status" role="status" aria-live="polite">尚未运行。可先查看已有记录。</div>
+  <div id="engineering-summary" class="engineering-summary"></div>
+  <div id="engineering-results" class="table-scroll"></div>
+  <div id="engineering-downloads" class="controls"></div>
+  <p class="muted">六类自建工程探针用于小范围验收，不是通用排行榜。失败样本保留，未知用量单列；重启后仅展示记录，不自动继续实验。</p>
+</details>

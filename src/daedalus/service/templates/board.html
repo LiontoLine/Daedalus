@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Daedalus · 总览{% endblock %}
+{% block content %}
+<section class="panel panel-lead">
+  <header class="panel-head"><div><span class="eyebrow">PROJECTS / TASKS</span><h2>任务</h2><p class="panel-sub">选择一个任务，进入它的 DAG 工作台。</p></div><a class="button primary" href="/">＋ 新建任务</a></header>
+<div id="task-summary" class="summary-strip" aria-live="polite"></div>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <h2>我的任务</h2>
+    <div class="controls">
+      <label class="check"><input type="checkbox" id="auto-refresh" checked /> 实时</label>
+      <button id="refresh" class="ghost">刷新</button>
+    </div>
+  </header>
+
+  <div id="board-error" class="alert" hidden></div>
+
+  <div class="collection-tools"><input id="board-search" type="search" aria-label="搜索任务" placeholder="搜索任务名称、目标或编号…" /><label>状态 <select id="board-filter"><option value="all">全部任务</option><option value="active">执行中</option><option value="attention">需关注</option><option value="done">已完成</option></select></label></div>
+  <div id="task-cards" class="task-cards" aria-live="polite"></div>
+  <details class="secondary-details"><summary>运行记录与指标</summary>
+  <div class="panel-inset">
+    <h3>运行概况</h3>
+    <div id="metrics-bars" class="metrics-bars"></div>
+  </div>
+
+  <table class="table" id="runs">
+    <thead>
+      <tr><th>Run</th><th>Goal</th><th>状态</th><th>步骤</th><th>Spec</th><th>更新</th></tr>
+    </thead>
+    <tbody><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+  </table>
+</details>
+  <details class="disclose">
+    <summary>高级创建：手动指定验收与边界</summary>
+    <form id="new-run" class="grid">
+      <label>仓库路径<input name="repo_path" required placeholder="/path/to/repo" /></label>
+      <label>Goal id<input name="goal_id" value="GOAL-001" /></label>
+      <label class="wide">目标<input name="objective" required placeholder="make summarize() count words" /></label>
+      <label class="wide">可写路径（逗号分隔）<input name="target_paths" required placeholder="src/pkg/module.py" /></label>
+      <label class="wide">验收命令<input name="test_command" required placeholder="python3 -m pytest tests -q" /></label>
+      <label>风险
+        <select name="risk_level">
+          <option value="low">low</option>
+          <option value="normal" selected>normal</option>
+          <option value="high">high</option>
+          <option value="critical">critical</option>
+        </select>
+      </label>
+      <label class="check"><input type="checkbox" name="use_model" /> 使用配置的模型</label>
+      <span class="muted">模型任务自动进行语义审查与目标审计</span>
+      <label class="wide">以谁的名义签批（high/critical 必填）<input name="approve_spec_by" placeholder="你的名字" /></label>
+      <div class="wide"><button type="submit" class="primary">创建并执行</button>
+        <span class="muted">创建后进入工作台，跟踪步骤进度与执行结果。</span></div>
+    </form>
+  </details>
+
+</section>
+{% endblock %}

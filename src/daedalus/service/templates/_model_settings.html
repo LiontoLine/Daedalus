@@ -1,0 +1,33 @@
+<dialog id="model-settings-dialog" class="model-dialog" aria-labelledby="model-dialog-title">
+  <section id="model-panel" class="model-settings">
+    <header class="model-dialog-head"><div><span class="eyebrow">MODEL CONNECTIONS</span><h2 id="model-dialog-title">模型设置</h2><p id="model-summary" class="muted">选择服务商，或直接导入已有配置。</p></div><button type="button" id="model-close" class="ghost" aria-label="关闭模型设置">✕</button></header>
+    <div class="model-dialog-body">
+      <div class="model-import-tools"><button type="button" id="model-import-file" class="primary">导入配置文件</button><input type="file" id="model-file" accept=".json,.toml,.env,.txt" hidden /><button type="button" id="model-paste-toggle" class="ghost">粘贴配置</button><button type="button" id="model-template" class="ghost small">下载模板</button><button type="button" id="model-export" class="ghost small">导出配置</button></div>
+      <p class="muted model-import-help">支持 JSON、TOML、.env，也可导入 Claude / Codex 的 API 配置。导入后先预览，再应用。</p>
+      <div id="model-import-box" hidden><label class="field">粘贴模型配置<textarea id="model-import-content" rows="5" spellcheck="false" autocomplete="off" placeholder='{"provider":"deepseek","model":"你的模型ID","api_key_env":"DEEPSEEK_API_KEY"}'></textarea></label><button type="button" id="model-import-preview" class="ghost">预览导入</button></div>
+      <div id="model-import-preview-box" class="model-import-preview" hidden></div>
+      <div class="model-current-head"><h3>当前生效的模型</h3><button type="button" id="model-reset" class="ghost small" hidden>恢复启动配置</button></div>
+      <div id="model-current" class="model-current"></div>
+      <p id="model-server-note" class="alert" hidden></p>
+      <div class="model-current-head"><h3>添加或调整连接</h3><span id="model-protocol-label" class="model-format-tag">选择服务商</span></div>
+      <div id="model-form">
+        <div class="model-grid">
+          <label>服务商<select id="model-provider"><option value="custom">自定义 / OpenAI 兼容</option></select></label>
+          <label>生效范围<select id="model-role"><option value="">全部角色</option><option value="planner">规划模型 · Planner</option><option value="coder">编码模型 · Coder</option><option value="reviewer">审查模型 · Reviewer</option></select></label>
+          <label class="wide">API 根地址<input id="model-base-url" type="url" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" /></label>
+          <label class="wide">模型 ID<div class="model-name-row"><input id="model-name" list="model-choices" placeholder="填写服务商控制台中的模型 ID" autocomplete="off" spellcheck="false" /><button type="button" id="model-discover" class="ghost small">获取模型列表</button></div><datalist id="model-choices"></datalist></label>
+          <label>API Key<input id="model-key" type="password" placeholder="输入密钥，本地模型可留空" autocomplete="new-password" /></label>
+          <label>超时（秒）<input id="model-timeout" type="number" min="5" max="900" value="120" /></label>
+        </div>
+        <p id="model-provider-hint" class="muted"></p>
+        <details class="model-advanced"><summary>协议与兼容选项</summary><div class="model-grid"><label>请求协议<select id="model-protocol"><option value="openai_chat">OpenAI Chat Completions（兼容）</option><option value="openai_responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages（Claude）</option><option value="gemini">Google Gemini（原生）</option></select></label><label>密钥环境变量（可选）<input id="model-key-env" placeholder="例如 DEEPSEEK_API_KEY" autocomplete="off" /></label><label class="wide">兼容参数 JSON<textarea id="model-options" rows="3" spellcheck="false" placeholder='例如 {"send_temperature":false,"token_limit_field":"max_completion_tokens"}'></textarea></label></div></details>
+        <label class="switch model-ack" id="model-ack-wrap" hidden><input type="checkbox" id="model-ack" /><span>允许将任务及所需仓库内容发送到所选的非本机模型接口。</span></label>
+        <label class="switch"><input type="checkbox" id="model-persist" checked /><span>安全保存连接，重启后自动恢复</span></label>
+        <div class="model-actions"><button type="button" id="model-test" class="ghost">测试连接</button><button type="button" id="model-save" class="primary">应用模型</button><span id="model-note" class="muted"></span></div>
+      </div>
+      <div id="model-out" class="callout" role="status" aria-live="polite" hidden></div>
+      <p id="model-caveat" class="muted model-caveat">密钥保存到 macOS 系统钥匙串，连接配置与导出不包含密钥。取消安全保存可使用临时连接。</p>
+      <p class="muted model-caveat">支持的接口会为结构化提问、规划、编码与审查使用任务级低推理模式，避免推理占满输出额度。你显式填写的推理参数优先，保存的连接不会被改写。</p>
+    </div>
+  </section>
+</dialog>

@@ -1,0 +1,65 @@
+<div class="view-tabs" role="tablist" aria-label="审计视图"><button id="audit-tab-result" role="tab" data-audit-tab="result" aria-controls="audit-view-result" aria-selected="true" tabindex="0">结果概览</button><button id="audit-tab-changes" role="tab" data-audit-tab="changes" aria-controls="audit-view-changes" aria-selected="false" tabindex="-1">代码改动</button><button id="audit-tab-events" role="tab" data-audit-tab="events" aria-controls="audit-view-events" aria-selected="false" tabindex="-1">事件追溯</button></div>
+<div id="audit-view-result" role="tabpanel" aria-labelledby="audit-tab-result" data-audit-view="result">
+<section class="panel"><header class="panel-head"><div><h2>目标达成审计</h2><p class="panel-sub">对照原始目标审查整轮结果；偏离后进入新 stage，包含首次最多 3 轮。</p></div></header><div id="goal-audit"></div></section>
+<section class="panel" id="independent-validation-panel"><header class="panel-head"><div><h2>独立交付复核</h2><p class="panel-sub">高风险任务：重新验收 → 另一位复核人签署 → 继续交付。</p></div></header><div id="independent-validation" aria-live="polite"></div></section>
+<section class="panel"><header class="panel-head"><h2>合规与证据完整度</h2><span class="muted">点击分项查看依据</span></header><div id="audit-main"></div>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2>交付记录</h2>
+      <p class="panel-sub">谁 / 何时 / 哪个 spec / 哪个 model / 哪个 image / 改了什么 /
+        跑了什么 / 测试结果 / 谁批准 / 最终 commit</p>
+    </div>
+  </header>
+  <div id="audit" class="muted">loading…</div>
+</section>
+
+<section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2>证据一致性</h2>
+      <p class="panel-sub">verify / recover / 告警 / 身份 / 指标</p>
+    </div>
+    <div class="controls"><a class="button ghost" href="/operations">运维详情</a></div>
+  </header>
+  <div id="identity-out" class="muted">loading…</div>
+  <div id="metrics-bars" class="metrics-bars"></div>
+  <pre id="metrics" class="code" hidden></pre>
+</section>
+</div>
+<div id="audit-view-changes" role="tabpanel" aria-labelledby="audit-tab-changes" data-audit-view="changes" hidden><section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2>代码 diff</h2>
+      <p class="panel-sub">每个步骤门禁通过时的补丁；被拒绝的尝试也留着，因为那正是要复查的东西</p>
+    </div>
+    <div class="controls">
+      <div class="seg" id="diff-mode">
+        <button type="button" data-mode="line-by-line" class="on">逐行</button>
+        <button type="button" data-mode="side-by-side">并排</button>
+      </div>
+      <label class="field">步骤 <select id="diff-step"></select></label>
+    </div>
+  </header>
+  <div id="diff-summary" class="diff-summary muted"></div>
+  <div id="diff" class="diff-host"><p class="empty">loading…</p></div>
+</section>
+
+</div>
+<div id="audit-view-events" role="tabpanel" aria-labelledby="audit-tab-events" data-audit-view="events" hidden><section class="panel">
+  <header class="panel-head">
+    <div>
+      <h2>事件流</h2>
+      <p class="panel-sub">每个事实一行；事件日志是权威，其余都是可重建的缓存</p>
+    </div>
+  </header>
+<div class="collection-tools"><input id="event-search" type="search" aria-label="搜索事件" placeholder="搜索事件、角色、步骤或详情…" /><span id="event-count" class="muted" aria-live="polite"></span></div><div class="table-scroll">
+  <table class="table" id="events">
+    <thead><tr><th>#</th><th>事件</th><th>详情</th><th>引用</th><th>角色</th><th>时间</th></tr></thead>
+    <tbody><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+  </table></div>
+</section>
+
+</div>

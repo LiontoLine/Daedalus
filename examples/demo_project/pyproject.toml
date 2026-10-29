@@ -1,0 +1,11 @@
+[project]
+name = "example-project"
+version = "0.1.0"
+description = "Target repository for the Daedalus Phase-1 demo"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+python_files = ["test_*.py"]
+addopts = ["-q"]
