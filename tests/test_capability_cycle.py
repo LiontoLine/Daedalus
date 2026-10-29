@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from daedalus.application.upstream_contract import compile_contract
 from daedalus.config import Settings, WorkspaceSettings
+from daedalus.infrastructure.knowledge import atomic_json
 from daedalus.service.app import create_app
 
 
@@ -89,7 +90,7 @@ def cycle(tmp_path, monkeypatch):
                 {"usage_available": True, "prompt_tokens": 100, "completion_tokens": 50}
             ]
         }
-        (destination / "series-usage.json").write_text(json.dumps(usage))
+        atomic_json(destination / "series-usage.json", usage)
         return {"status": "COMPLETE", "series_reported_tokens": 150, "series_logical_calls": 1}
 
     monkeypatch.setattr(routes, "run_realwork", execute)

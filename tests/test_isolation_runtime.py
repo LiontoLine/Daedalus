@@ -20,7 +20,7 @@ def runtime(tmp_path):
     assert driver.probe().available
     box = tmp_path / "workspace"
     box.mkdir()
-    box.chmod(0o777)
+    box.chmod(0o700)
     boundary = BoundarySpec(
         "runtime",
         "runtime",
@@ -60,7 +60,7 @@ def test_confinement_can_write_mount_but_cannot_read_host_canary(runtime):
 def test_confinement_readonly_root_and_unprivileged_identity(runtime):
     result = command(
         runtime,
-        "import os,errno; assert os.getuid()==65534; "
+        "import os,errno; assert os.getuid()>0 and os.getgid()>0; "
         "assert 'CapEff:\t0000000000000000' in open('/proc/self/status').read(); "
         "\ntry: open('/var/tmp/daedalus-root-write','w')\n"
         "except OSError as e: assert e.errno==errno.EROFS\n"

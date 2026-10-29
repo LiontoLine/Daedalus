@@ -138,7 +138,8 @@ def test_container_argv_applies_the_spec_security_profile(tmp_path: Path) -> Non
     assert argv[0] == "docker" and argv[1] == "run"
     assert "--rm" in argv
     # Non-root.
-    assert "--user" in argv and "65534:65534" in argv
+    uid, gid = map(int, argv[argv.index("--user") + 1].split(":"))
+    assert uid > 0 and gid > 0
     # No network unless the policy allows it.
     assert "--network none" in joined
     # Read-only base image, with the worktree as the only writable mount.
@@ -159,8 +160,17 @@ def test_container_argv_applies_the_spec_security_profile(tmp_path: Path) -> Non
     # The image precedes the command, and nothing follows the command, so no part of the
     # command can be reinterpreted as a docker flag.
     command = ["python3", "-m", "pytest", "tests", "-q"]
-    assert argv[-len(command) - 1] == "python:3.12-slim"
     assert argv[-len(command):] == command
+
+def test_container_identity_never_inherits_root(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    monkeypatch.setattr(os, "getgid", lambda: 0)
+    argv = ContainerDriver().build_argv(
+        runtime=_runtime(), worktree=tmp_path, command=["true"], boundary=_boundary(),
+    )
+    uid, gid = map(int, argv[argv.index("--user") + 1].split(":"))
+    assert uid > 0 and gid > 0
+
 
 
 def test_container_argv_never_mounts_a_host_credential() -> None:
@@ -292,15 +302,20 @@ def test_a_container_actually_isolates_the_command(tmp_path: Path) -> None:  # p
     report = driver.probe()
     assert report.available, report.detail
 
+    tmp_path.chmod(0o700)
     (tmp_path / "probe.txt").write_text("hello from the mount\n", encoding="utf-8")
+    (tmp_path / "probe.txt").chmod(0o600)
     outcome = driver.run(
         worktree=tmp_path,
-        command=["python3", "-c", "print(open('probe.txt').read().strip())"],
+        command=["python3", "-c",
+                 "from pathlib import Path; p = Path('probe.txt'); "
+                 "value = p.read_text(); p.write_text(value + 'updated\\n'); print(value.strip())"],
         timeout_sec=180,
         boundary=_boundary(),
     )
     assert outcome.ok, outcome.combined()
     assert "hello from the mount" in outcome.stdout
+    assert (tmp_path / "probe.txt").read_text().endswith("updated\n")
 
     # The container is not root.
     whoami = driver.run(
@@ -309,7 +324,7 @@ def test_a_container_actually_isolates_the_command(tmp_path: Path) -> None:  # p
         timeout_sec=120,
         boundary=_boundary(),
     )
-    assert whoami.stdout.strip() == "65534"
+    assert int(whoami.stdout.strip()) > 0
 
     # And the network really is denied at runtime, not only at gate time.
     network = driver.run(

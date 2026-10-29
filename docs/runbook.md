@@ -74,6 +74,21 @@ daedalus preflight --config "$CONFIG" --isolation container
 
 探测某级别不等于永久设置所有任务的隔离策略；提交任务前仍应核对其实际驱动、网络边界和证据。对不可信代码，不应接受 `host-process`，也不应把 Seatbelt 当作读隔离。不要为绕过依赖安装问题而临时放开网络；离线依赖流程见[依赖完整性](dependency-integrity.md)。
 
+### 容器任务环境
+
+宿主虚拟环境中的依赖不会自动出现在容器里。默认 `python:3.12-slim` 只提供基础 Python 环境，不能假定含有 `pytest` 或目标项目依赖。应在可信镜像构建阶段准备它们，任务执行期间仍保持禁网和只读根文件系统。
+
+在源码根目录可为离线示例与 CI 构建测试镜像，并在启动服务或测试之前指定：
+
+```bash
+docker build --file .github/sandbox.Dockerfile --tag daedalus-ci-python:3.12 .github
+export DAEDALUS_SANDBOX_IMAGE=daedalus-ci-python:3.12
+```
+
+`DAEDALUS_SANDBOX_IMAGE` 是部署级默认值；程序显式传入的 `sandbox_image` 优先。这个示例镜像包含 `pytest` 和 Node.js 24，不是任意项目的完整依赖环境，也不构成生产安全验收。运行器已安装 Node.js，并不意味着容器内也能执行它。生产镜像应单独审查并固定可信摘要。
+
+容器以服务账户的非零 UID/GID 访问挂载工作树；为零或平台没有 POSIX 身份时使用非特权身份，不运行容器 root。非 root 服务账户拥有的私有工作目录不需要改成全员可读写。以 root 启动服务、Rootless 引擎或虚拟机文件共享时，仍需核实实际所有权映射和访问权限；不要用 `chmod 777`、挂载宿主凭证或开放任务网络来绕过失败。
+
 ### 选择启动方式
 
 本机交互使用托管入口：

@@ -237,8 +237,8 @@ class RunOrchestrator:
     #: starts. Enforced rather than documented, because "we meant to get sign-off" is how an
     #: unreviewed high-risk change ships.
     require_spec_approval: bool = True
-    #: Container image for the container driver, when one is selected.
-    sandbox_image: str = "python:3.12-slim"
+    #: Explicit container image; empty uses the deployment's registry default.
+    sandbox_image: str = ""
     #: Spec §11.1 commit precondition. 0 disables.
     execution_ttl_sec: int = 86_400
     #: Spec §17 exponential backoff between infrastructure retries.

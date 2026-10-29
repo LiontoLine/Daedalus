@@ -14,6 +14,7 @@ never quietly fall back to a weaker driver when the stronger one was requested. 
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from daedalus.domain.spec import BoundarySpec, NetworkPolicy
@@ -71,6 +72,7 @@ class DriverRegistry:
 
     @staticmethod
     def default(image: str = "") -> "DriverRegistry":
+        image = image or os.environ.get("DAEDALUS_SANDBOX_IMAGE", "")
         container = ContainerDriver(**({"image": image} if image else {}))
         return DriverRegistry(
             drivers={

@@ -59,6 +59,7 @@ def test_permission_denial_does_not_claim_existing_supervisor_is_dead(monkeypatc
 def test_launchagent_preserves_normal_stop_and_contains_no_model_secret(
     saved, tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(autostart.sys, "platform", "darwin")
     path = tmp_path / "LaunchAgents/service.plist"
     monkeypatch.setattr(autostart, "plist_for", lambda _: path)
     monkeypatch.setattr(autostart, "status", lambda _: {"loaded": False})
@@ -72,6 +73,22 @@ def test_launchagent_preserves_normal_stop_and_contains_no_model_secret(
     assert set(spec["EnvironmentVariables"]) == {"PYTHONPATH", "DAEDALUS_LAUNCHD"}
     assert path.stat().st_mode & 0o777 == 0o600
     command.assert_called_once()
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_launchagent_install_refuses_unsupported_platform_without_side_effects(
+    saved, tmp_path, monkeypatch, platform
+):
+    monkeypatch.setattr(autostart.sys, "platform", platform)
+    path = tmp_path / "LaunchAgents/service.plist"
+    monkeypatch.setattr(autostart, "plist_for", lambda _: path)
+    command = Mock()
+    monkeypatch.setattr(autostart, "command", command)
+    with pytest.raises(DaedalusError):
+        autostart.install(saved.source_path, saved.workspace.root_path)
+    assert not path.parent.exists()
+    assert not (saved.workspace.root_path / ".service").exists()
+    command.assert_not_called()
 
 
 def test_bootstrap_failure_does_not_stop_current_backend(saved, monkeypatch):

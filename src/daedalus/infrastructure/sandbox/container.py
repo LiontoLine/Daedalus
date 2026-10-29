@@ -126,8 +126,8 @@ class ContainerDriver:
             identity=Capability(
                 "non-root",
                 True,
-                "runs as an unprivileged user with all capabilities dropped and "
-                "no-new-privileges",
+                "uses the service user's non-root UID/GID where available, otherwise nobody; "
+                "all capabilities dropped and no-new-privileges",
             ),
             detail=(
                 f"container isolation through {runtime.binary} "
@@ -232,6 +232,11 @@ class ContainerDriver:
         network = "none" if boundary.network_policy is NetworkPolicy.DENY else "none"
         # A domain allowlist cannot be expressed by `--network`; probe() marks such a boundary
         # unavailable. If one reaches here anyway, `none` is the fail-closed choice.
+        # Match the bind mount's normal service-user access without making private
+        # worktrees world-readable or ever executing as container root.
+        uid, gid = (os.getuid(), os.getgid()) if os.name == "posix" else (65534, 65534)
+        user = f"{uid or 65534}:{gid or 65534}"
+
 
         argv: list[str] = [
             runtime.binary,
@@ -242,7 +247,7 @@ class ContainerDriver:
             network,
             "--read-only",
             "--user",
-            "65534:65534",  # nobody:nogroup inside the image
+            user,
             "--workdir",
             "/workspace",
             "--cap-drop",
@@ -305,7 +310,8 @@ class ContainerDriver:
                 outcome = CommandOutcome(command=" ".join(command), exit_code=completed.returncode,
                     stdout=redact_text(completed.stdout or ""), stderr=redact_text(completed.stderr or ""),
                     duration_ms=int((time.monotonic() - started) * 1000), driver=self.name,
-                    isolation={"runtime": runtime.kind, "network": "none", "user": "65534:65534",
+                    isolation={"runtime": runtime.kind, "network": "none",
+                               "user": argv[argv.index("--user") + 1],
                                "container_name": name, "read_only_base": True,
                                "total_disk_quota": False})
             except subprocess.TimeoutExpired as expired:

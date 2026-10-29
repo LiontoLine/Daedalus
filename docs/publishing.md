@@ -10,7 +10,7 @@
 | `tests/` | 测试源码和合成夹具；排除缓存 | 行为与安全边界的可复现验证 |
 | `examples/demo_project/` | 示例源码与配置 | 无凭证入门示例 |
 | `scripts/` | 顶层安装、演示和验证脚本，不含 `maintenance/` | 日常使用与 CI 所需 |
-| `.github/workflows/ci.yml` | CI 配置 | 离线回归、服务检查和构建 |
+| `.github/workflows/ci.yml`、`.github/sandbox.Dockerfile` | CI 配置与任务测试镜像定义 | 离线回归、服务检查和构建 |
 | `docs/` | 仅 `.gitignore` 明确放行的技术 Markdown | 安装、操作、安全与架构说明 |
 | 根目录 | `README.md`、`PROJECT_INDEX.md`、`CONTRIBUTING.md`、`SECURITY.md`、`AGENTS.md`、`LICENSE`、`pyproject.toml`、`.gitignore`、`Daedalus_System_Implementation_Spec_v2.1.md` | 导航、开发约定、许可和实现契约 |
 
@@ -76,6 +76,31 @@ git push -u origin main
 - 如需接收敏感漏洞报告，启用 Private vulnerability reporting，见 [SECURITY.md](../SECURITY.md)。
 - 首次推送后检查 Actions。不要为离线 CI 配置真实模型 API key。
 - 发布 Release 前重新检查源码压缩包和 wheel；开发测试产物不等于公开制品。
+
+## CI 检查与失败定位
+
+CI 在 Ubuntu 24.04 和 macOS 上检查 Python 3.12；Linux 使用固定镜像标签，避免 `ubuntu-latest` 的系统迁移混入代码诊断。Job 名包含操作系统，便于区分平台失败。
+
+动作使用支持 Node.js 24 的 `actions/checkout@v5`、`actions/setup-python@v6` 和 `actions/upload-artifact@v7`。动作运行时与项目使用的 Python 是两回事；Node 弃用、镜像迁移和排队通知不能代替失败步骤的错误日志。
+
+Linux 行为测试和发布诊断会先构建含测试依赖的任务镜像，再通过 `DAEDALUS_SANDBOX_IMAGE` 指定它；不能把宿主的 `pip install` 当作容器内依赖已安装。保持真实容器检查，不因运行时可用而跳过测试或降级隔离。配置方式见[容器任务环境](runbook.md#容器任务环境)。
+
+发布诊断先通过 `status` 初始化空工作区，再创建并验证备份。诊断步骤临时生成两份不同的合成签名秘密，注册 owner/reviewer，并在日志中掩码；它们只用于 CI 初始化，不使用真实模型密钥或生产审批秘密，也不构成生产批准。
+
+本地检查实际服务路径：
+
+```bash
+python scripts/live_check.py
+```
+
+该脚本使用临时仓库、本机假模型网关及真实 HTTP 服务，覆盖任务执行、摘要绑定的步骤审查、逐项目标验收和规划确认。冻结请求必须携带刚查看的 `spec_digest`；不应通过关闭审查或省略确认来让检查通过。安装 Node.js 后才会执行前端渲染检查；没有 Node.js 时会明确报告跳过。
+
+Actions 显示失败时，打开失败 Job 内的红色步骤，保留失败命令、断言或 traceback，分享前去掉凭证和个人信息。仅有 `Process completed with exit code 1` 不足以判断根因。
+
+GitHub 下载的源码 ZIP 不包含 `.git/` 和 Actions 日志。修复这种副本后，应将改动提交到原仓库：使用已有 clone，或在 GitHub 网页按原路径替换文件。不要在下载副本里另建无关历史后强制推送。
+
+动作运行时依据：[checkout v5](https://github.com/actions/checkout/blob/v5/action.yml)、[setup-python v6](https://github.com/actions/setup-python/blob/v6/action.yml)、[upload-artifact v7](https://github.com/actions/upload-artifact/blob/v7/action.yml)。
+
 
 ## 文档编排参考
 

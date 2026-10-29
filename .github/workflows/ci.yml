@@ -13,6 +13,8 @@ jobs:
   verify:
     name: Verify (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    env:
+      DAEDALUS_SANDBOX_IMAGE: daedalus-ci-python:3.12
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +34,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+
+      - name: Build the isolated task test environment
+        if: runner.os == 'Linux'
+        run: docker build --file .github/sandbox.Dockerfile --tag "$DAEDALUS_SANDBOX_IMAGE" .github
 
       - name: Report the isolation actually available
         run: daedalus preflight --workspace "$RUNNER_TEMP/daedalus-ci" || true
@@ -62,6 +68,8 @@ jobs:
     name: Development release diagnostics
     runs-on: ubuntu-24.04
     needs: verify
+    env:
+      DAEDALUS_SANDBOX_IMAGE: daedalus-ci-python:3.12
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -70,13 +78,26 @@ jobs:
       - run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+      - name: Build the isolated task test environment
+        run: docker build --file .github/sandbox.Dockerfile --tag "$DAEDALUS_SANDBOX_IMAGE" .github
       - name: Build a workspace with a verified snapshot
         run: |
+          daedalus status --workspace "$RUNNER_TEMP/daedalus-gate"
           daedalus backup --workspace "$RUNNER_TEMP/daedalus-gate" --label ci
       - name: Diagnostic checks (not production approval)
         # Production remains blocked until deployment-bound security evidence exists.
         # This job reports development health and must not authorize deployment.
-        run: daedalus release-gate --mode development --workspace "$RUNNER_TEMP/daedalus-gate"
+        run: |
+          # Synthetic, per-job identities; never use production signing secrets in CI.
+          export CI_OWNER_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+          export CI_REVIEWER_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+          echo "::add-mask::$CI_OWNER_SECRET"
+          echo "::add-mask::$CI_REVIEWER_SECRET"
+          daedalus owners add --workspace "$RUNNER_TEMP/daedalus-gate" \
+            --owner-id ci-owner --role owner --secret-env CI_OWNER_SECRET
+          daedalus owners add --workspace "$RUNNER_TEMP/daedalus-gate" \
+            --owner-id ci-reviewer --role reviewer --secret-env CI_REVIEWER_SECRET
+          daedalus release-gate --mode development --workspace "$RUNNER_TEMP/daedalus-gate"
 
   package:
     name: Build the wheel
@@ -103,4 +124,3 @@ jobs:
         with:
           name: daedalus-wheel
           path: dist/*.whl
-
