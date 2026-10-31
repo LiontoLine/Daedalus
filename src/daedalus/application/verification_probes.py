@@ -142,7 +142,7 @@ def run_goal_probes(root: Path, client, bounds: ResourceBounds):
                 "expected_child_runs": len(view["iterations"]) == len(expected) - 1,
                 "delivery_policy": (result.status == "COMPLETED" and head != original)
                 if kind == "drift"
-                else (result.status == "AWAITING_APPROVAL" and head == original),
+                else (result.status == "PARTIAL_FAILURE" and head == original),
                 "event_sequences_valid": not store.verify_sequences(),
                 "step_invariants_valid": not store.step_invariant_violations(),
             }

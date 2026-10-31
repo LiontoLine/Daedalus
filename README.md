@@ -2,7 +2,7 @@
 
 **面向受监督代码任务的确定性控制平面。** 将模型提出的方案与代码候选，交给明确的规格、执行边界、门禁和事件记录管理，而不是让模型直接决定权威状态。
 
-[快速开始](#快速开始) · [文档](docs/README.md) · [项目导航](PROJECT_INDEX.md) · [参与贡献](CONTRIBUTING.md) · [安全说明](SECURITY.md)
+[快速开始](#快速开始) · [更新记录](CHANGELOG.md) · [文档](docs/README.md) · [项目导航](PROJECT_INDEX.md) · [参与贡献](CONTRIBUTING.md) · [安全说明](SECURITY.md)
 
 ## 项目解决什么问题
 

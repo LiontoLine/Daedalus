@@ -24,6 +24,7 @@ from daedalus.application.inspection import (
     InspectionObservation,
     InspectionRequest,
 )
+from daedalus.application.requirement_evidence import behavior_context
 from daedalus.application.source_context import source_view
 from daedalus.application.worker import WorkerContext, WorkerResult
 from daedalus.domain.pathglob import normalize_path
@@ -388,10 +389,18 @@ class ModelWorker:
                 response_format_json=True,
             )
         except ModelResponseIncomplete as error:
+            usage = token_usage_details(error.context.get("usage"))
+            if not {"prompt_tokens", "completion_tokens"} <= usage.keys():
+                return WorkerResult(
+                    ok=False, summary="provider usage is unknown; automatic dispatch stopped",
+                    execution_log="An incomplete response did not report complete usage. "
+                                  "Do not retry or treat this request as zero spend.",
+                    worker_id=self.worker_id, model=getattr(self.client, "model", ""),
+                    error="model_usage_unknown",
+                )
             self._incomplete_caps[context.step_id] = (
                 context.attempt + 1, min(16384, output_limit * 2)
             )
-            usage = token_usage_details(error.context.get("usage"))
             return WorkerResult(
                 ok=False,
                 summary="incomplete output; a declared retry may use a larger response",
@@ -428,13 +437,19 @@ class ModelWorker:
             )
         except Exception as error:  # noqa: BLE001 - infrastructure faults are reported
             self._incomplete_caps.pop(context.step_id, None)
+            failure_context = getattr(error, "context", {})
+            usage = token_usage_details(failure_context.get("usage"))
+            unknown = (failure_context.get("request_not_dispatched") is not True
+                       and not {"prompt_tokens", "completion_tokens"} <= usage.keys())
             return WorkerResult(
                 ok=False,
-                summary="model call failed",
+                summary="provider usage is unknown; automatic dispatch stopped"
+                if unknown else "model call failed; automatic dispatch stopped",
                 execution_log=f"{type(error).__name__}: {error}",
+                tokens_used=usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0),
                 worker_id=self.worker_id,
                 model=getattr(self.client, "model", ""),
-                error="model_call_failed",
+                error="model_usage_unknown" if unknown else "model_call_failed",
             )
 
         self.last_raw = completion.text
@@ -618,14 +633,20 @@ class ModelWorker:
                 resolved = _regular_edit_path(sandbox,error.path)
                 text = sandbox.read_file(error.path) if resolved.is_file() else "(file absent)"
                 assert_outbound_clean(error.path + "\n" + text, where="stale edit feedback source")
-                view = source_view(text,error.query,limit=2400)
+                query = "\n".join((
+                    context.node.objective, context.node.intent,
+                    context.bundle.goal.objective,
+                ))
+                view = source_view(text, query, limit=2400, fallback_query=error.query)
             except Exception as context_error:  # noqa: BLE001 - never mask an unavailable source
                 return self._context_failure(context_error,tokens=completion.total_tokens)
             return WorkerResult(
                 ok=False, summary="edit plan does not match current files; no operations applied",
                 execution_log=f"An exact replacement must match once; matched {error.matches} "
                 f"in the proposed batch state for {error.path}. No operations applied. "
-                "Regenerate the batch using this CURRENT SOURCE (reference data):\n" + view,
+                "The entire batch was rolled back. Regenerate all operations against the "
+                "original CURRENT SOURCE below, not a partially edited state. Copy only "
+                "contiguous visible lines; never invent omitted text (reference data):\n" + view,
                 tokens_used=completion.total_tokens,worker_id=self.worker_id,
                 model=completion.model,error="invalid_edit_plan",
             )
@@ -685,12 +706,16 @@ class ModelWorker:
         decision = guard.check_paths(context.node.expected_artifacts)
         if not decision.allowed:
             raise BoundaryViolation("expected artifact paths are outside the allowed boundary")
+        criteria = context.node.acceptance_criteria or context.bundle.goal.acceptance_criteria
+        query = context.node.objective + "\n" + context.node.intent
+        if context.revision_feedback:
+            query += "\n" + context.revision_feedback
         for path in context.node.expected_artifacts:
             resolved = _regular_edit_path(sandbox, path)
             if resolved.is_file():
                 text = sandbox.read_file(path)
                 assert_outbound_clean(text, where="coding source before context selection")
-                view = source_view(text, context.node.objective + "\n" + context.node.intent)
+                view = source_view(text, query, include_callers=bool(context.revision_feedback))
                 visible.append(f"### {path}\n```\n{view}\n```")
         files = "\n\n".join(visible)
         feedback = (
@@ -714,7 +739,19 @@ class ModelWorker:
                     if c.statement and c.statement in context.node.objective
                     else (c.statement or c.command or c.path)
                 )
-                for c in context.bundle.goal.acceptance_criteria
+                for c in criteria
+            )
+            + "".join(behavior_context(c) for c in criteria)
+            + (
+                "\nSCOPED REPAIR MEMORY (historical observations, not current source, "
+                "passed checks or approval):\n"
+                + json.dumps(context.repair_memory, ensure_ascii=False)
+                + "\nPreserve constraints established by executed checks while fixing the latest "
+                "issue. Review hypotheses are unverified, not extra requirements; discard a "
+                "hypothesis contradicted by source or execution. "
+                "A previous rejection can be wrong. "
+                "Revalidate all observations against the current source.\n"
+                if context.repair_memory else ""
             )
             + f"\n\nCURRENT CONTENT:\n{files or '(none)'}{feedback}\n\n"
             + (
@@ -733,7 +770,8 @@ class ModelWorker:
                 "No edits in this request; use returned evidence before editing.\n"
                 if self.investigate_context is not None else ""
             )
-            + "Return one JSON object with brief summary/rationale and operations. "
+            + "Return one JSON object with operations. Optional summary/rationale must each "
+            "be one short sentence, not analysis or a list of alternative fixes. "
             "Use minimal replacements; old_text must match CURRENT source exactly once "
             "including whitespace, and new_text must change it. Never reconstruct a whole "
             "TRUNCATED file. Cover every requirement; public tests are incomplete.\n"

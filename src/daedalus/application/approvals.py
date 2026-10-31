@@ -42,6 +42,25 @@ class NotEscalated(ApprovalError):
     code = "not_escalated"
 
 
+def execution_authorization_required(store: EventStore, step_id: str) -> bool:
+    """Only a recorded mandatory authorization is actionable, never a generic failure."""
+    step = store.get_step(step_id)
+    if step is None or str(step["state"]) != StepState.ESCALATED.value:
+        return False
+    run = store.get_run(str(step["run_id"]))
+    if (run is None or str(run["status"]) not in {"RUNNING", "AWAITING_APPROVAL"}
+            or str(run["execution_id"]) != str(step["execution_id"])):
+        return False
+    spec = store.get_spec(str(step["spec_digest"]))
+    if spec is None or str(spec["risk_level"]) != "critical":
+        return False
+    for event in reversed(store.events_for(f"step:{step_id}")):
+        if (event.execution_id == str(step["execution_id"])
+                and event.event_type == "StepExecutionFailed"):
+            return event.payload.get("approval_required") is True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalResult:
     approval_id: str
@@ -133,6 +152,17 @@ class ApprovalService:
                 "answer an escalation",
                 step_id=step_id,
                 state=state.value,
+            )
+        if str(run["status"]) != "AWAITING_APPROVAL":
+            raise ApprovalError(
+                "this run has no active authorization request; a failed delivery cannot "
+                "be accepted or restarted by approving its failed step",
+                run_id=run_id, status=str(run["status"]),
+            )
+        if not execution_authorization_required(self.store, step_id):
+            raise ApprovalError(
+                "this step is a failed candidate, not an execution authorization request",
+                run_id=run_id, step_id=step_id,
             )
 
         if chosen is ApprovalDecision.PROCEED:
@@ -291,10 +321,10 @@ class ApprovalService:
         pending: list[dict[str, object]] = []
         runs = [self.store.get_run(run_id)] if run_id else self.store.list_runs()
         for run in runs:
-            if run is None:
+            if run is None or str(run["status"]) != "AWAITING_APPROVAL":
                 continue
             for step in self.store.list_steps(str(run["run_id"])):
-                if str(step["state"]) != StepState.ESCALATED.value:
+                if not execution_authorization_required(self.store, str(step["step_id"])):
                     continue
                 approval = self.store.latest_approval(str(step["step_id"]))
                 if approval is not None:
@@ -321,9 +351,14 @@ class ApprovalService:
         Returns `{step_id: action}` describing what was applied, so the caller can report
         exactly which human decisions took effect.
         """
+        run = self.store.get_run(run_id)
+        if run is None:
+            raise ApprovalError("run not found", run_id=run_id)
+        if str(run["status"]) != "AWAITING_APPROVAL":
+            return {}
         applied: dict[str, str] = {}
         for step in self.store.list_steps(run_id):
-            if str(step["state"]) != StepState.ESCALATED.value:
+            if not execution_authorization_required(self.store, str(step["step_id"])):
                 continue
             step_id = str(step["step_id"])
             approval = self.store.latest_approval(step_id)

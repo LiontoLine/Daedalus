@@ -69,6 +69,11 @@ def dependency_context(
                     node.lineno <= line <= node.end_lineno for line in changed_lines.get(name, ())
                 ):
                     focus.add(node.name)
+                    # Preserve the owner, not only an ambiguous name such as save().
+                    focus.update(
+                        cls.name for cls in classes.values()
+                        if cls.lineno < node.lineno <= cls.end_lineno
+                    )
             local_query += "\nChanged symbols: " + " ".join(sorted(focus))
             parents = focus & classes.keys()
             inherited = set()
@@ -90,7 +95,8 @@ def dependency_context(
                         "source_kind": "candidate_worktree",
                         "sha256": hashlib.sha256(candidate.encode()).hexdigest(),
                         "truncated": len(candidate) > 3200,
-                        "text": source_view(candidate, local_query, limit=3200),
+                        "text": source_view(candidate, local_query, limit=3200,
+                                            include_callers=True),
                     }
                 )
         except (SyntaxError, UnicodeError):

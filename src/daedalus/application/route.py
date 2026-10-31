@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from daedalus.application.approvals import execution_authorization_required
 from daedalus.domain.fsm import LEASE_HOLDING_STATES, StepState
 from daedalus.infrastructure.store.event_store import EventStore
 
@@ -648,12 +649,16 @@ def _attach_actions(
         row = steps.get(node.step_id)
         state = str(row["state"]) if row else node.state
         is_latest = latest.get(node.plan_node_id) is node
+        actionable = (
+            is_latest and run_status == "AWAITING_APPROVAL"
+            and execution_authorization_required(store, node.step_id)
+        )
 
         retry_reason = ""
         if not is_latest:
             retry_reason = "已被后续尝试取代；只有最新一次尝试可以处置"
         elif state == StepState.ESCALATED.value:
-            retry_reason = ""
+            retry_reason = "" if actionable else "执行失败不是待授权请求；不能人工覆盖"
         elif state in {StepState.LOST.value, StepState.STALE.value}:
             retry_reason = "先运行 recover 修复工作区，再 resume；该步骤会被重新调度"
         elif state in {StepState.FAILED.value, StepState.TIMEOUT.value}:
@@ -677,8 +682,8 @@ def _attach_actions(
             }
         )
         reject_reason = (
-            "" if state == StepState.ESCALATED.value and is_latest
-            else "只有处于 ESCALATED 的最新尝试可以被打回"
+            "" if actionable
+            else "只有明确待授权的最新尝试可以被打回"
         )
         actions.append(
             {

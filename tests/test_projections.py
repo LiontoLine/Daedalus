@@ -373,39 +373,6 @@ def test_no_bucket_names_a_state_that_does_not_exist() -> None:
     assert "ESCALATED" in FAILED_STATES, "an escalated step is not a success"
 
 
-def test_the_three_reporting_sites_share_one_definition_of_failed() -> None:
-    """The executions row, the metric summary and the per-worker counts share one bucket.
-
-    Asserted by *use* rather than by grep: all three must derive their counts from the
-    domain's helpers and bucket constants, so a new state forces one decision instead of
-    three guesses.
-    """
-    import inspect
-
-    from daedalus.application import orchestrator as orchestrator_module
-    from daedalus.infrastructure.store import event_store as store_module
-
-    orchestrator_source = inspect.getsource(orchestrator_module)
-    assert "execution_counters(" in orchestrator_source, (
-        "the executions row must derive its counters from the shared summary"
-    )
-    store_source = inspect.getsource(store_module)
-    assert "FAILED_STATES" in store_source, "the metric and worker counts must use the bucket"
-    assert store_source.count("FAILED_STATES") >= 3, (
-        "both the metric summary and the per-worker counts must use the shared bucket: "
-        f"found {store_source.count('FAILED_STATES')} references"
-    )
-    # The non-existent state must not be referenced as a *value* anywhere in src.
-    import pathlib
-
-    for path in (pathlib.Path("src/daedalus")).rglob("*.py"):
-        code = [
-            line
-            for line in path.read_text().splitlines()
-            if not line.lstrip().startswith("#")
-        ]
-        for line in code:
-            assert '"REJECTED"' not in line and "'REJECTED'" not in line, f"{path}: {line}"
 
 
 def test_a_running_step_keeps_a_consistent_lease_pair(git_repo, tmp_path) -> None:

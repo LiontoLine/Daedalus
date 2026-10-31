@@ -138,7 +138,7 @@ def test_shell_infrastructure_fault_stops_after_one_candidate(git_repo, tmp_path
         )
         owner.register_spec()
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL", [(s.feedback, s.reasons) for s in result.steps]
+        assert result.status == "FAILED", [(s.feedback, s.reasons) for s in result.steps]
         assert len(calls) == 1 and result.steps[0].attempt == 1
         assert not result.commits
         assert not any(

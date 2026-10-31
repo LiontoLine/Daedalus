@@ -299,3 +299,225 @@ def test_contract_check_uses_only_unspent_existing_cap_and_never_reopens(tmp_pat
         assert observed[0]["contract_smoke"]["prior_cost_upper_cny"]==.00006
         assert observed[0]["max_calls"]==12 and observed[0]["max_tokens"]==60000
         assert client.post("/api/realwork-contract-check",json={"confirm_paid_calls":True}).status_code==409
+
+
+@pytest.fixture
+def known_task_replay(tmp_path, monkeypatch):
+    """Local upstreams exercise setup, orchestration and the independent evaluator."""
+    import hashlib
+
+    project = tmp_path / "project"
+    upstream = project / "upstream"
+    upstream.mkdir(parents=True)
+    (upstream / "solution.py").write_text("def value(): return 1\n")
+    (upstream / "upstream_tests.py").write_text(
+        "from solution import value\nassert value() > 0\n")
+    sources = {
+        "src/daedalus/application/runner.py": "RUNNER = 1\n",
+        "src/daedalus/service/routes.py": "ROUTES = 1\n",
+        "src/daedalus/domain/policy.py": "POLICY = 1\n",
+    }
+    for relative, content in sources.items():
+        source = project / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(content)
+    data = project / "data"
+    cases = []
+    for name in ("known-c", "known-a", "known-b"):
+        task = data / "tasks" / name / "task.json"
+        task.parent.mkdir(parents=True)
+        task.write_text(json.dumps({
+            "problem_statement": "Return two without changing any public APIs.",
+            "test_patch":
+                "diff --git a/upstream_tests.py b/upstream_tests.py\n"
+                "--- a/upstream_tests.py\n+++ b/upstream_tests.py\n@@ -1,2 +1,2 @@\n"
+                " from solution import value\n-assert value() > 0\n+assert value() == 2\n",
+        }))
+        cases.append({
+            "case": name, "base_commit": "frozen", "targets": ["solution.py"],
+            "labels": ["upstream_tests"], "archive_sha256": "archive",
+            "source_chars": 22, "upstream_root": "upstream",
+        })
+    monkeypatch.setattr(realwork, "PROJECT", project)
+    monkeypatch.setattr(realwork, "DATA", data)
+    monkeypatch.setattr(realwork, "test_command",
+                        lambda row, **kwargs: [sys.executable, "upstream_tests.py"])
+    context = {
+        "study": "known-task-development-replay-v1", "phase": "known-task-replay",
+        "plan_sha256": "a" * 64, "comparison_job_id": "historical_compact",
+        "comparison_arm": "optimized", "selection_plan_sha256": "b" * 64,
+        "parent_jobs": {"historical_compact": {
+            "usage_sha256": "c" * 64, "protocol_sha256": "d" * 64,
+            "unknown_reservations": [],
+        }},
+        "authorization": {
+            "scope": "replay-only", "max_cost_cny": 1, "available_balance_cny": 3.68,
+            "source": "User explicitly selected 新增上限1元 on 2026-10-30 for latest "
+                      "three sealed tasks; no automatic expansion",
+        },
+        "historical_budget": {
+            "max_cost_cny": 4.5, "user_authorized_cap_cny": 5, "reserve_cny": 0.5,
+            "unknown_reserved_cost_cny": 2.25, "occupied_cost_cny": 4.17717,
+        },
+        "cases": cases,
+        "monetary_admission": {
+            "max_total_cost_cny": 1, "prior_cost_upper_cny": 0,
+            "user_authorized_cap_cny": 1, "reserve_cny": 0,
+            "unknown_reserved_cost_cny": 0,
+        },
+    }
+    manifest = {relative: hashlib.sha256(content.encode()).hexdigest()
+                for relative, content in sources.items()}
+    return context, manifest
+
+
+@pytest.mark.parametrize("other_mode", [
+    {"continuation": {}}, {"optimization": True}, {"contract_smoke": {}}, {"cycle": {}},
+])
+def test_known_task_replay_rejects_ambiguous_modes_before_creating_results(
+    tmp_path, known_task_replay, other_mode
+):
+    replay, _ = known_task_replay
+    destination = tmp_path / "results"
+    with pytest.raises(ValueError):
+        realwork.run_realwork(destination, object(), stop_requested=lambda: False,
+                             replay=replay, max_tokens=90000, max_calls=18, **other_mode)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("max_tokens,max_calls", [(90001, 18), (90000, 19)])
+def test_known_task_replay_cannot_raise_series_caps(
+    tmp_path, known_task_replay, max_tokens, max_calls
+):
+    replay, _ = known_task_replay
+    destination = tmp_path / "results"
+    with pytest.raises(ValueError):
+        realwork.run_realwork(destination, object(), stop_requested=lambda: False,
+                             replay=replay, max_tokens=max_tokens, max_calls=max_calls)
+    assert not (destination / "protocol.json").exists()
+
+
+def test_known_task_replay_retains_original_order_full_provenance_and_failed_trials(
+    tmp_path, known_task_replay
+):
+    from daedalus.model.base import Completion
+
+    replay, manifest = known_task_replay
+    destination = tmp_path / "results"
+    dispatched = []
+
+    def complete(messages, **options):
+        admission = json.loads(next(
+            path for path in sorted((destination / "monetary-admissions").glob("*.json"))
+            if json.loads(path.read_text())["state"] == "PREPARED"
+        ).read_text())
+        dispatched.append(admission)
+        return Completion('{"summary":"No fix proposed","operations":[]}',
+                          model="offline", prompt_tokens=10, completion_tokens=5)
+
+    client = SimpleNamespace(model="offline", name="local-only", complete=complete)
+    report = realwork.run_realwork(destination, client, stop_requested=lambda: False,
+                                  replay=replay, max_tokens=90000, max_calls=18)
+    protocol = json.loads((destination / "protocol.json").read_text())
+    saved = json.loads((destination / "report.json").read_text())
+    assert report["status"] == "COMPLETE"
+    assert [row["case"] for row in report["trials"]] == [row["case"] for row in replay["cases"]]
+    assert {row["arm"] for row in report["trials"]} == {"daedalus"}
+    assert all(not row["delivered"] and row["hidden_patch_applied"]
+               and not row["heldout_passed"] for row in report["trials"])
+    assert all((destination / row["artifact_root"] / "daedalus-events.json").is_file()
+               for row in report["trials"])
+    assert saved["study"] == protocol["study"] == replay["study"]
+    assert saved["phase"] == protocol["phase"] == replay["phase"]
+    assert saved["replay"] == protocol["replay"] == {
+        key: value for key, value in replay.items() if key not in {"cases", "monetary_admission"}
+    }
+    assert saved["implementation_sha256"] == protocol["implementation_sha256"] == manifest
+    assert saved["selection_rule_sha256"] == replay["plan_sha256"]
+    assert saved["monetary_admission"] == replay["monetary_admission"]
+    assert len(dispatched) <= 18
+    assert all(row["model_calls"] <= 6 for row in report["trials"])
+    assert all(admission["prior_budget_occupied_cny"] == 0 for admission in dispatched)
+    assert saved["replay"]["historical_budget"] == replay["historical_budget"]
+    assert saved["replay"]["authorization"] == replay["authorization"]
+
+
+@pytest.mark.parametrize("usage_on_error", [None, {"prompt_tokens": 10, "completion_tokens": 5}])
+def test_known_task_replay_persists_failed_dispatch_and_stops_on_unknown_usage(
+    tmp_path, known_task_replay, usage_on_error
+):
+    replay, _ = known_task_replay
+    destination = tmp_path / "results"
+    dispatched = []
+
+    def complete(messages, **options):
+        prepared = [json.loads(path.read_text())
+                    for path in (destination / "monetary-admissions").glob("*.json")]
+        assert sum(row["state"] == "PREPARED" for row in prepared) == 1
+        dispatched.append(True)
+        context = {"usage": usage_on_error} if usage_on_error is not None else {}
+        raise ModelError("local simulated supplier failure", **context)
+
+    client = SimpleNamespace(model="offline", name="local-only", complete=complete)
+    report = realwork.run_realwork(destination, client, stop_requested=lambda: False,
+                                  replay=replay, max_tokens=90000, max_calls=18)
+    usage = json.loads((destination / "series-usage.json").read_text())
+    admissions = [json.loads(path.read_text())
+                  for path in sorted((destination / "monetary-admissions").glob("*.json"))]
+    assert len(admissions) == len(dispatched) == usage["logical_calls"]
+    assert all(row["state"] == "RETURNED" and row["call_record"]["request_dispatched"]
+               for row in admissions)
+    assert all(row["call_record"] == call
+               for row, call in zip(admissions, usage["call_records"]))
+    if usage_on_error is None:
+        assert len(dispatched) == len(report["trials"]) == 1
+        assert report["status"] == "INCOMPLETE"
+        assert report["stop_reason"] == "provider_usage_unknown"
+        assert not usage["call_records"][0].get("usage_available", False)
+    else:
+        assert len(report["trials"]) == 3
+        assert all(call["usage_available"] for call in usage["call_records"])
+        assert usage["reported_tokens"] == len(dispatched) * 15
+
+
+def test_known_task_replay_never_resets_exhausted_active_allowance(
+    tmp_path, known_task_replay
+):
+    replay, _ = known_task_replay
+    replay["monetary_admission"]["prior_cost_upper_cny"] = 1
+    dispatched = []
+    client = SimpleNamespace(model="offline", name="local-only",
+                             complete=lambda *args, **kwargs: dispatched.append(True))
+    destination = tmp_path / "results"
+    report = realwork.run_realwork(destination, client, stop_requested=lambda: False,
+                                  replay=replay, max_tokens=90000, max_calls=18)
+    assert not dispatched
+    assert report["status"] == "INCOMPLETE"
+    assert report["stop_reason"] == "whole_study_monetary_reserve"
+    assert report["series_logical_calls"] == 0
+    assert len(report["trials"]) == 1
+    assert not list((destination / "monetary-admissions").glob("*.json"))
+    usage = json.loads((destination / "series-usage.json").read_text())
+    assert usage["call_records"] == []
+
+
+@pytest.mark.parametrize("change", [
+    {"authorization": {}},
+    {"authorization": {"scope": "replay-only", "max_cost_cny": 2, "source": "not approved"}},
+    {"historical_budget": {}},
+    {"monetary_admission": {
+        "max_total_cost_cny": 4.5, "prior_cost_upper_cny": 4.17717,
+        "user_authorized_cap_cny": 5, "reserve_cny": 0.5,
+        "unknown_reserved_cost_cny": 2.25,
+    }},
+])
+def test_known_task_replay_requires_separate_bounded_authorization(
+    tmp_path, known_task_replay, change
+):
+    replay, _ = known_task_replay
+    replay.update(change)
+    destination = tmp_path / "results"
+    with pytest.raises(ValueError):
+        realwork.run_realwork(destination, object(), stop_requested=lambda: False,
+                             replay=replay, max_tokens=90000, max_calls=18)
+    assert not destination.exists()

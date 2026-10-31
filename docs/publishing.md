@@ -12,7 +12,7 @@
 | `scripts/` | 顶层安装、演示和验证脚本，不含 `maintenance/` | 日常使用与 CI 所需 |
 | `.github/workflows/ci.yml`、`.github/sandbox.Dockerfile` | CI 配置与任务测试镜像定义 | 离线回归、服务检查和构建 |
 | `docs/` | 仅 `.gitignore` 明确放行的技术 Markdown | 安装、操作、安全与架构说明 |
-| 根目录 | `README.md`、`PROJECT_INDEX.md`、`CONTRIBUTING.md`、`SECURITY.md`、`AGENTS.md`、`LICENSE`、`pyproject.toml`、`.gitignore`、`Daedalus_System_Implementation_Spec_v2.1.md` | 导航、开发约定、许可和实现契约 |
+| 根目录 | `README.md`、`CHANGELOG.md`、`PROJECT_INDEX.md`、`CONTRIBUTING.md`、`SECURITY.md`、`AGENTS.md`、`LICENSE`、`pyproject.toml`、`.gitignore`、`Daedalus_System_Implementation_Spec_v2.1.md` | 导航、更新记录、开发约定、许可和实现契约 |
 
 以下内容不纳入默认公开包：
 

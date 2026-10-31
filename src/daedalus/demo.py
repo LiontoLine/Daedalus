@@ -28,13 +28,11 @@ from pathlib import Path
 from typing import Any
 
 from daedalus.application.coding_worker import FileOp, ScriptedWorker
-from daedalus.application.gatekeeper.decision import GateDecision
-from daedalus.application.gatekeeper.tier2 import (
-    SemanticReviewRequest,
-    SemanticReviewResult,
-    Tier2Gate,
+from daedalus.application.gatekeeper.tier2 import Tier2Gate
+from daedalus.application.independent_validation import (
+    IndependentValidationService,
+    pending_validation,
 )
-from daedalus.application.approvals import ApprovalService
 from daedalus.application.cache_worker import CacheMissWorker
 from daedalus.application.fsm_service import StateMachineService
 from daedalus.application.identity import OwnerRegistry
@@ -48,9 +46,7 @@ from daedalus.application.planner import (
 )
 from daedalus.application.scheduler import Quota
 from daedalus.application.worker import WorkerContext, WorkerResult
-from daedalus.domain.identity import Role
-from daedalus.errors import DaedalusError
-from daedalus.domain.approval import ApprovalDecision
+from daedalus.domain.identity import Role, SignatureRequired
 from daedalus.domain.spec import (
     AcceptanceCriterion,
     AssertionKind,
@@ -66,7 +62,6 @@ from daedalus.domain.spec import (
 )
 from daedalus.infrastructure.git_sandbox import GitSandbox, init_repo, initial_commit
 from daedalus.infrastructure.store import EventStore
-from daedalus.model.base import Completion, Message
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEMO_PROJECT = REPO_ROOT / "examples" / "demo_project"
@@ -839,43 +834,53 @@ def run_rollback_replay_scenario(workspace: Path) -> dict[str, Any]:
 
 
 def run_approval_scenario(workspace: Path) -> dict[str, Any]:
-    """Scenario 09: the human-in-the-loop cycle.
+    """Scenario 09: authorize delivery of a complete, goal-validated candidate.
 
-    A semantic review escalates, the run parks and keeps the pending change alive, a human
-    owner approves that exact artifact, and the resumed run commits it. Without this cycle
-    the system is correct but unusable: every escalation would be a dead end.
-
-    The spec is deliberately HIGH risk and the workspace deliberately has an owner enrolled,
-    because that is the only configuration in which Spec §3.2 does anything. A demo that ran
-    with no owners would exercise the unenrolled path where a typed name is accepted — which
-    is the path that needs no demonstration, and is precisely how a §3.2 regression would go
-    unnoticed by CI.
+    The spec owner signs before execution. After every step commits privately and
+    the full goal audit passes, a distinct enrolled owner reviews fresh acceptance
+    evidence and signs the exact delivery claim. Resume publishes that candidate;
+    it does not approve a semantic failure or restart a failed step.
     """
     name = "09-owner-approval"
     owner_secret_env = "DAEDALUS_DEMO_OWNER_SECRET"
-    demo_env = {owner_secret_env: "demo-owner-signing-secret"}
+    validator_secret_env = "DAEDALUS_DEMO_VALIDATOR_SECRET"
+    demo_env = {
+        owner_secret_env: "demo-owner-signing-secret",
+        validator_secret_env: "demo-validator-signing-secret",
+    }
     root = workspace / name
     root.mkdir(parents=True, exist_ok=True)
     repo = _prepare_repo(root)
     store = EventStore(root / "daedalus.db")
     bundle = _with_risk(_bundle("GOAL-owner-approval", "fix the word counter"), RiskLevel.HIGH)
 
-    class EscalatingReviewer:
-        """A well-formed, subject-bound ESCALATE: the kind of question a human must answer."""
+    class CandidateReviewer:
+        """Scripted semantic evidence for the known correct demo candidate."""
 
-        name = "escalating-reviewer"
+        name = "candidate-reviewer"
 
         def complete(self, prompt: str, *, subject_digest: str) -> str:
             return json.dumps(
                 {
-                    "decision": "ESCALATE",
+                    "decision": "APPROVE",
                     "subject_digest": subject_digest,
-                    "reasons": ["the change alters a function other modules depend on"],
+                    "reasons": ["split() counts whitespace-separated words and handles empty input"],
                     "violations": [],
-                    "confidence": 0.35,
+                    "confidence": 0.9,
+                    "criterion_results": [
+                        {
+                            "criterion_id": criterion.criterion_id,
+                            "status": "MET",
+                            "evidence": "the integrated split() implementation passes the frozen tests",
+                        }
+                        for criterion in bundle.goal.acceptance_criteria
+                    ],
                 }
             )
 
+    identity = OwnerRegistry(store=store, environ=demo_env)
+    identity.enroll("owner@example", role=Role.OWNER, secret_env=owner_secret_env)
+    identity.enroll("validator@example", role=Role.OWNER, secret_env=validator_secret_env)
     orchestrator = RunOrchestrator(
         store=store,
         repo_path=repo,
@@ -883,87 +888,86 @@ def run_approval_scenario(workspace: Path) -> dict[str, Any]:
         bundle=bundle,
         worker=ScriptedWorker(
             ops=(FileOp(op="write", path=TARGET, content=CORRECT_IMPLEMENTATION),),
-            worker_id="worker-park",
+            worker_id="worker-candidate",
             summary="count words with split() and handle empty input",
         ),
-        tier2=Tier2Gate(reviewer=EscalatingReviewer()),
+        tier2=Tier2Gate(reviewer=CandidateReviewer()),
         quota=Quota(max_parallel_steps=1),
-        park_on_escalation=True,
+        identity=identity,
+        goal_audit_enabled=True,
+        independent_validation_levels=("high", "critical"),
     )
     main_before = GitSandbox.main_commit(repo)
-    identity = OwnerRegistry(store=store, environ=demo_env)
-    identity.enroll("owner@example", role=Role.OWNER, secret_env=owner_secret_env)
-    orchestrator.identity = identity
     orchestrator.register_spec()
-    # §3.2 layer one: the frozen spec itself must be signed before any work starts.
     orchestrator.approve_spec(
         approved_by="owner@example",
         signature=identity.sign("owner@example", orchestrator.spec_digest),
     )
     parked = orchestrator.run()
-
-    step = store.list_steps(parked.run_id)[0]
-    step_id = str(step["step_id"])
-    artifact_digest = str(store.artifacts_for_step(step_id)[-1]["artifact_digest"])
-    worktree = str(step["worktree_path"])
-    # Measured *while parked*: the resume legitimately removes the worktree once the work has
-    # landed, so checking later would report the wrong thing.
-    worktree_kept_while_parked = Path(worktree).is_dir()
-    # §3.2 layer two: the decision that lets the escalated artifact commit must also be
-    # signed, and the signature names this exact artifact.
-    signature = identity.sign_step(
-        "owner@example",
+    request = pending_validation(store, parked.run_id)
+    if request is None:
+        raise AssertionError("the complete candidate has no required delivery review")
+    parked_steps = store.list_steps(parked.run_id)
+    target_unchanged_while_parked = GitSandbox.main_commit(repo) == main_before
+    goal_events = store.events_for(f"goal:{parked.run_id}")
+    goal_approved_candidate = any(
+        event.event_type == "GoalAuditCompleted"
+        and event.payload.get("decision") == "APPROVE"
+        and event.payload.get("commit") == request["commit"]
+        for event in goal_events
+    )
+    validation_service = IndependentValidationService(store=store, identity=identity)
+    evaluation = validation_service.evaluate(parked.run_id)
+    claim = validation_service.claim(
         parked.run_id,
-        step_id,
-        "proceed",
-        artifact_digest,
-        attempt=int(step["attempt"]),
+        evaluation["validation_id"],
+        decision="APPROVE",
+        review_notes="Demo review: the exact candidate preserves the API and passes fresh frozen tests.",
     )
-    approval_service = ApprovalService(
-        store=store, fsm=StateMachineService(store), identity=identity
-    )
-    pending = approval_service.pending_escalations(parked.run_id)
-    approval = approval_service.approve(
-        run_id=parked.run_id,
-        step_id=step_id,
-        decision=ApprovalDecision.PROCEED,
-        approved_by="owner@example",
-        note="read the diff; the callers are all updated in the same change",
-        artifact_digest=artifact_digest,
-        signature=signature,
-    )
-    # An unsigned decision must be refused here, so the demo proves the control is enforcing
-    # rather than merely present. The refusal happens before anything is recorded, so the
-    # probe cannot disturb the run — which an earlier version of this scenario did, on a
-    # NORMAL-risk spec where an unsigned retry is legitimately allowed.
+    # Probe the active request before signing it: only a missing signature is expected,
+    # and refusal must leave the delivery waiting for a real verified attestation.
     unsigned_refused = False
     try:
-        approval_service.approve(
-            run_id=parked.run_id,
-            step_id=step_id,
-            decision=ApprovalDecision.RETRY,
-            approved_by="owner@example",
-            note="unsigned attempt, which must not be accepted",
+        validation_service.attest(
+            parked.run_id,
+            evaluation["validation_id"],
+            validator_id="validator@example",
+            signature="",
+            decision=claim.decision,
+            review_notes=claim.review_notes,
         )
-    except DaedalusError:
+    except SignatureRequired:
         unsigned_refused = True
+    approval = validation_service.attest(
+        parked.run_id,
+        evaluation["validation_id"],
+        validator_id="validator@example",
+        signature=identity.sign_validation("validator@example", claim.digest()),
+        decision=claim.decision,
+        review_notes=claim.review_notes,
+    )
     resumed = resume_run(
         store=store, run_id=parked.run_id, workspace=str(root), identity=identity
     )
     main_after = GitSandbox.main_commit(repo)
+    events = store.events_for_execution(orchestrator.execution_id)
+    started = next(event.payload for event in events if event.event_type == "RunStarted")
+    delivery = next(
+        (event.payload for event in events if event.event_type == "DeliveryCompleted"), {}
+    )
 
     report = {
         "scenario": name,
-        "title": "An escalation parks the run; the owner approves; the resume commits",
+        "title": "A complete candidate waits for signed owner review; resume delivers it",
         "expectation": (
-            "parked in AWAITING_APPROVAL with the worktree kept -> approval binds to the "
-            "artifact -> resume commits it and records who approved"
+            "all steps committed privately and goal validated -> AWAITING_APPROVAL -> "
+            "distinct owner signs the frozen candidate -> resume advances only the frozen target"
         ),
         "status": resumed.status,
         "steps": [outcome.to_row() for outcome in resumed.steps],
         "commits": [commit[:12] for commit in resumed.commits],
-        "approval_verified": approval.verified,
-        "approval_scheme": approval.approval_scheme,
+        "approval_verified": approval["verified"],
+        "approval_scheme": approval["scheme"],
         "identity_enforced": identity.enforced,
         "unsigned_decision_refused": unsigned_refused,
         "main_before": main_before[:12],
@@ -980,24 +984,30 @@ def run_approval_scenario(workspace: Path) -> dict[str, Any]:
         "findings": _findings(store, resumed),
         "human_loop": {
             "parked_status": parked.status,
-            "parked_escalations": len(pending),
-            "worktree_kept": worktree_kept_while_parked,
-            "artifact_digest": artifact_digest[:12],
-            "approval_id": approval.approval_id,
-            "approved_by": approval.approved_by,
-            "bound_artifact": approval.artifact_digest[:12],
-            "commit_records_owner_override": any(
-                event.event_type == "StepCommitted" and event.payload.get("owner_override")
-                for event in store.all_events()
-            ),
-            "commit_approved_by": next(
-                (
-                    str(event.payload.get("approved_by", ""))
-                    for event in store.all_events()
-                    if event.event_type == "StepCommitted" and event.payload.get("owner_override")
-                ),
-                "",
-            ),
+            "parked_steps_committed": bool(parked_steps)
+            and all(step["state"] == "COMMITTED" for step in parked_steps),
+            "target_unchanged_while_parked": target_unchanged_while_parked,
+            "goal_approved_candidate": goal_approved_candidate,
+            "fresh_acceptance_passed": evaluation["checks_passed"] and evaluation["tree_unchanged"],
+            "request_id": request["request_id"],
+            "approval_id": approval["validation_id"],
+            "approved_by": approval["validator_id"],
+            "candidate_commit": request["commit"],
+            "bound_commit": approval["commit"],
+            "delivered_commit": resumed.promoted_commit,
+            "request_subject_bound": all(
+                evaluation[key] == request[key]
+                for key in ("run_id", "execution_id", "spec_digest", "request_id", "commit")
+            )
+            and approval["request_id"] == request["request_id"]
+            and approval["report_digest"] == claim.report_digest == evaluation["report_digest"]
+            and approval["claim_digest"] == claim.digest(),
+            "frozen_target_preserved": delivery.get("target_branch")
+            == started["target_branch"] == orchestrator.target_branch
+            and delivery.get("before") == main_before,
+            "delivery_records_approval": delivery.get("independent_validation_required") is True
+            and delivery.get("independent_validation_id") == approval["validation_id"]
+            and delivery.get("commit") == approval["commit"] == main_after,
         },
     }
     store.close()
@@ -1074,16 +1084,17 @@ def _print_report(report: dict[str, Any]) -> None:
     loop = report.get("human_loop")
     if loop:
         print(
-            f"  escalation  : parked={loop['parked_status']} "
-            f"pending={loop['parked_escalations']} worktree_kept={loop['worktree_kept']}"
+            f"  delivery    : parked={loop['parked_status']} "
+            f"steps_committed={loop['parked_steps_committed']} "
+            f"target_unchanged={loop['target_unchanged_while_parked']}"
         )
         print(
             f"    approval  : {loop['approval_id'][:20]} by {loop['approved_by']} "
-            f"bound_to_artifact={loop['bound_artifact']}"
+            f"bound_to_commit={loop['bound_commit'][:12]}"
         )
         print(
-            f"    commit    : owner_override={loop['commit_records_owner_override']} "
-            f"approved_by={loop['commit_approved_by']}"
+            f"    delivered : {loop['delivered_commit'][:12]} "
+            f"records_approval={loop['delivery_records_approval']}"
         )
     parallel = report.get("parallel")
     if parallel:
@@ -1158,14 +1169,29 @@ def main(argv: list[str] | None = None) -> int:
         reports.append(approval_report)
         _print_report(approval_report)
         loop = approval_report["human_loop"]
+        if approval_report["status"] != "COMPLETED" or not approval_report["main_advanced"]:
+            failures.append(f"{approval_name}: the authorized candidate was not delivered")
         if loop["parked_status"] != "AWAITING_APPROVAL":
-            failures.append(f"{approval_name}: the run did not park on escalation")
-        if not loop["worktree_kept"]:
-            failures.append(f"{approval_name}: the parked worktree was discarded")
-        if not loop["commit_records_owner_override"]:
-            failures.append(f"{approval_name}: the commit does not record the owner override")
+            failures.append(f"{approval_name}: the run did not wait for required delivery review")
+        for check in (
+            "parked_steps_committed",
+            "target_unchanged_while_parked",
+            "goal_approved_candidate",
+            "fresh_acceptance_passed",
+            "request_subject_bound",
+            "frozen_target_preserved",
+            "delivery_records_approval",
+        ):
+            if not loop[check]:
+                failures.append(f"{approval_name}: {check} failed")
+        if not approval_report["approval_verified"] or not approval_report["unsigned_decision_refused"]:
+            failures.append(f"{approval_name}: signed owner authorization was not enforced")
+        if not (
+            loop["candidate_commit"] == loop["bound_commit"] == loop["delivered_commit"]
+        ):
+            failures.append(f"{approval_name}: delivery differs from the approved candidate")
         if not approval_report["commits"]:
-            failures.append(f"{approval_name}: the approved artifact was not committed")
+            failures.append(f"{approval_name}: the approved candidate has no committed steps")
 
     print(_rule("*"))
     committed = [r for r in reports if r["main_advanced"]]

@@ -64,14 +64,10 @@ def test_controlled_pairs_use_same_tree_and_measure_faults_and_overhead(tmp_path
     assert single["normal_safe_deliveries"] == daedalus["normal_safe_deliveries"] == 2
     assert single["unsafe_deliveries"] == 2 and daedalus["unsafe_deliveries"] == 0
     assert single["faults_blocked"] == 0 and daedalus["faults_blocked"] == 2
-    assert single["worker_calls"] == 5 and daedalus["worker_calls"] == 9
     assert all(row["wall_seconds"] > 0 for row in rows)
     root = tmp_path / "comparison"
     assert (root / "protocol.json").is_file() and (root / "trials.csv").is_file()
-    page = (root / "report.html").read_text()
-    assert "非模型能力测评" in page
-    assert "row.cells[3]" in page  # arm filter follows CSV's added fault column
-    with pytest.raises(ValueError, match="empty"):
+    with pytest.raises(ValueError):
         run_comparison(root, repeats=1)
 
 

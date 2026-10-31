@@ -34,7 +34,7 @@ class OfflineGoalClient:
                     "criterion_results": [
                         {
                             "criterion_id": c,
-                            "status": "MET",
+                            "status": "MET" if fixed else "UNMET",
                             "evidence": "public test and artifact are present",
                         }
                         for c in criteria

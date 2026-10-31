@@ -65,6 +65,14 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "GoalAuditEscalated",
         "GoalStageStarted",
         "GoalStageFinished",
+        # Immutable expectation evidence and isolated repair lineage, not FSM transitions.
+        "TrunkExpectationsFrozen",
+        "TrunkNodeValidated",
+        "TrunkNodeFailed",
+        "GoalTrunkSnapshot",
+        "RepairBranchStarted",
+        "RepairBranchRejected",
+        "RepairBranchPromoted",
         # audit side-channel
         "AuditNote",
         # intake lifecycle. The intake happens *before* any run exists, so these are recorded

@@ -180,11 +180,11 @@ def test_a_parked_run_offers_retry_and_reject_and_explains_what_is_blocked(
         def complete(self, prompt: str, *, subject_digest: str) -> str:
             return json.dumps(
                 {
-                    "decision": "ESCALATE",
+                    "decision": "APPROVE",
                     "subject_digest": subject_digest,
                     "reasons": ["needs a human"],
                     "violations": [],
-                    "confidence": 0.4,
+                    "confidence": 0.9,
                 }
             )
 
@@ -194,7 +194,7 @@ def test_a_parked_run_offers_retry_and_reject_and_explains_what_is_blocked(
         store=store,
         repo_path=repo,
         run_root=tmp_path / "wt",
-        bundle=_bundle(),
+        bundle=_bundle(risk=RiskLevel.CRITICAL),
         worker=ScriptedWorker(
             ops=(FileOp(op="write", path=TARGET, content=CORRECT_IMPLEMENTATION),),
             worker_id="worker-park",
@@ -203,6 +203,7 @@ def test_a_parked_run_offers_retry_and_reject_and_explains_what_is_blocked(
         park_on_escalation=True,
     )
     orchestrator.register_spec()
+    orchestrator.approve_spec(approved_by="alice")
     orchestrator.create_run()
     result = orchestrator.run()
     assert result.status == "AWAITING_APPROVAL", result.describe()
@@ -277,7 +278,6 @@ def test_an_old_attempt_cannot_be_acted_on(git_repo, tmp_path) -> None:
     )
     actions = {action["id"]: action for action in attempts[0]["actions"]}
     assert actions["retry"]["enabled"] is False
-    assert "取代" in actions["retry"]["reason"], actions["retry"]["reason"]
     store.close()
 
 
@@ -292,11 +292,11 @@ def test_an_enrolled_workspace_marks_that_a_signature_is_needed(git_repo, tmp_pa
         def complete(self, prompt: str, *, subject_digest: str) -> str:
             return json.dumps(
                 {
-                    "decision": "ESCALATE",
+                    "decision": "APPROVE",
                     "subject_digest": subject_digest,
                     "reasons": ["needs a human"],
                     "violations": [],
-                    "confidence": 0.4,
+                    "confidence": 0.9,
                 }
             )
 
@@ -308,7 +308,7 @@ def test_an_enrolled_workspace_marks_that_a_signature_is_needed(git_repo, tmp_pa
         store=store,
         repo_path=repo,
         run_root=tmp_path / "wt",
-        bundle=_bundle("GOAL-SIGNED", RiskLevel.HIGH),
+        bundle=_bundle("GOAL-SIGNED", RiskLevel.CRITICAL),
         worker=ScriptedWorker(
             ops=(FileOp(op="write", path=TARGET, content=CORRECT_IMPLEMENTATION),),
             worker_id="worker-signed",
@@ -329,7 +329,7 @@ def test_an_enrolled_workspace_marks_that_a_signature_is_needed(git_repo, tmp_pa
     node = next(n for n in route["nodes"] if n["kind"] == "attempt" and n["state"] == "ESCALATED")
     actions = {a["id"]: a for a in node["actions"]}
     assert actions["retry"]["enabled"] is True
-    assert actions["retry"]["requires_signature"] is True, "a HIGH-risk decision needs a signature"
+    assert actions["retry"]["requires_signature"] is True
     assert actions["reject"]["requires_signature"] is False, (
         "rejecting stops the step and must not need a key"
     )

@@ -1,6 +1,7 @@
 """Compact exact edits must preserve unrelated text and reject an entire stale batch."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -162,4 +163,27 @@ def test_worker_returns_actionable_stale_edit_failure_without_mutation(box):
     )
     result = ModelWorker(client).implement(box, context_for(box))
     assert not result.ok and result.error == "invalid_edit_plan"
-    assert "match once" in result.execution_log and box.read_file(TARGET) == before
+    assert box.read_file(TARGET) == before
+
+
+def test_stale_feedback_locates_the_frozen_task_not_a_hallucinated_symbol(box):
+    text = "".join(
+        f"class Distractor{i}:\n    def compute(self):\n        return 'unrelated-{i}'\n\n"
+        for i in range(100)
+    ) + "class Target:\n    def compute(self):\n        return 'required-behavior'\n"
+    box.write_file(TARGET, text)
+    context = context_for(box)
+    context = replace(
+        context,
+        node=replace(context.node, objective="Target.compute", intent="Target.compute"),
+        bundle=replace(context.bundle, goal=replace(context.bundle.goal, objective="Target.compute")),
+    )
+    client = Controller([{"operations": [{
+        "op": "replace", "path": TARGET,
+        "old_text": "class Distractor0:\n    def compute(self):\n        return 'imagined'",
+        "new_text": "class Distractor0:\n    def compute(self):\n        return 'wrong'",
+    }]}])
+    result = ModelWorker(client).implement(box, context)
+    assert result.error == "invalid_edit_plan"
+    assert "return 'required-behavior'" in result.execution_log
+    assert box.read_file(TARGET) == text

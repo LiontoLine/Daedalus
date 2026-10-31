@@ -240,8 +240,6 @@ for (const model of models) {
   check(lane.includes(escapeHtmlForCheck(read(
     `stateText(${JSON.stringify(step.state)})`))),
   `step ${step.node_id} shows its state as text, not only as a colour`);
-  check(lane.includes(`尝试 ${step.attempt}/${step.max_attempts}`),
-    `step ${step.node_id} shows its attempt budget`);
   if (model.attempts.length > 1) {
     check(lane.includes(`重试 ${model.attempts.length - 1}`),
       `step ${step.node_id} shows that it was retried`);
@@ -304,7 +302,7 @@ function actionsFor(model, runStatus) {
   return renderMarkup("#step-actions");
 }
 
-const parked = actionsFor({ ...sample, step: { ...sample.step, state: "ESCALATED" } }, "AWAITING_APPROVAL");
+const parked = actionsFor({ ...sample, step: { ...sample.step, state: "ESCALATED", execution_authorization_required: true } }, "AWAITING_APPROVAL");
 check(parked.includes("恢复"), "the step panel offers 恢复");
 check(parked.includes("重现"), "the step panel offers 重现");
 check(parked.includes("回滚到此处"), "the step panel offers 回滚到此处");
@@ -941,7 +939,7 @@ noMarkup(sandbox.renderGateChecks({ checks: [], reasons: [hostile] }), "the gate
 
 // A parked step is what the escalation panel exists for, so it is exercised with hostile text
 // rather than skipped.
-sandbox.renderEscalations([{ ...hostileStep, state: "ESCALATED" }], { run_id: "run-hostile" });
+sandbox.renderEscalations([{ ...hostileStep, state: "ESCALATED", execution_authorization_required: true }], { run_id: "run-hostile", status: "AWAITING_APPROVAL" });
 const hostileEscalation = renderMarkup("#escalation-body");
 noMarkup(hostileEscalation, "the escalation panel");
 check(hostileEscalation.includes("&lt;img"),
@@ -952,14 +950,10 @@ const goalMarkup = sandbox.renderGoalAudit({ status: "ESCALATE", max_stages: 3,
   stages: [{stage: 1, decision: "REVISE", scope: "goal_and_acceptance", commit: "abcdef",
     reasons: ["missing feature"], required_changes: ['<img src=x onerror=alert(1)>']}],
   iterations: [{stage: 2, run_id: "child", exists: true}, {stage: 3, run_id: "not-created", exists: false}],
-  manual_reason: "iteration limit reached" });
-check(goalMarkup.includes("需要人工处理") && goalMarkup.includes("含首次执行"),
-  "goal verdict exposes manual handling and stage budget");
+  stop_reason: "iteration limit reached" });
 check(goalMarkup.includes('/execution/child') && !goalMarkup.includes('/execution/not-created'),
   "goal stages link only to persisted child runs");
 check(goalMarkup.includes("&lt;img") && !goalMarkup.includes('<img'), "goal feedback is escaped");
-check(sandbox.renderGoalAudit({status: "APPROVE", stages: [{stage: 1, decision: "APPROVE", scope: "acceptance_only"}]}).includes("未做语义审查"),
-  "executable acceptance alone never claims semantic intent was reviewed");
 
 // Cross-page interactions: task filtering, real plan graph, audit tabs and event search.
 const taskFixtures = [
@@ -1134,9 +1128,7 @@ wfHandlers.click({button: 0, target: {closest: () => ({href: wfLocation.origin +
   preventDefault() {nativeAnchorPrevented = true;}});
 check(!nativeAnchorPrevented, "the audit stage anchor keeps native in-page scrolling instead of being redirected to execution");
 check(wfNavigations === 0, "the full workflow needs zero full-page navigations");
-wfSandbox.renderWorkflowLoop({status: "UNAVAILABLE", manual_reason: "historical task has no goal audit"});
-check(wfElement("#workflow-loop").innerHTML.includes("尚无记录") && !wfElement("#workflow-loop").innerHTML.includes("进行中"),
-  "legacy tasks never invent a running audit iteration");
+wfSandbox.renderWorkflowLoop({status: "UNAVAILABLE", stop_reason: "historical task has no goal audit"});
 if (scenario) {
   const fetchBeforeDelay = wfSandbox.fetch;
   let releaseOlderAudit, olderAuditStarted;

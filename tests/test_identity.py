@@ -818,16 +818,69 @@ def _balanced_call(source: str, start: int) -> str:
     raise AssertionError(f"unbalanced call at offset {start}")
 
 
-def test_the_demo_actually_enrols_an_owner_for_the_approval_scenario() -> None:
-    """CI cites the demo as evidence, so its §3.2 scenario must reach the enforced path."""
-    repo = Path(__file__).resolve().parent.parent
-    source = (repo / "src" / "daedalus" / "demo.py").read_text()
-    scenario = source[source.index("def run_approval_scenario") : source.index("def _print_report")]
-    assert "identity.enroll(" in scenario, "the demo's approval scenario must enrol an owner"
-    assert "sign_step(" in scenario, "it must sign the step decision"
-    assert "sign(" in scenario, "and sign the frozen spec"
-    assert "Identity" not in scenario or "identity" in scenario
-    assert "unsigned_refused" in scenario, "it must also show an unsigned decision refused"
+def test_demo_authorizes_only_the_complete_goal_validated_delivery(tmp_path) -> None:
+    """The public demo must exercise enforced approval, not accept a failed step."""
+    from daedalus.demo import run_approval_scenario
+    from daedalus.infrastructure.git_sandbox import GitSandbox
+
+    report = run_approval_scenario(tmp_path)
+    loop = report["human_loop"]
+    assert report["status"] == "COMPLETED"
+    assert report["identity_enforced"] and report["approval_verified"]
+    assert report["unsigned_decision_refused"]
+    assert loop["parked_status"] == "AWAITING_APPROVAL"
+    assert loop["parked_steps_committed"] and loop["target_unchanged_while_parked"]
+    assert loop["goal_approved_candidate"] and loop["fresh_acceptance_passed"]
+    assert loop["request_subject_bound"] and loop["frozen_target_preserved"]
+    assert loop["delivery_records_approval"]
+    assert loop["candidate_commit"] == loop["bound_commit"] == loop["delivered_commit"]
+
+    root = tmp_path / report["scenario"]
+    repo = root / "target_repo"
+    assert GitSandbox.main_commit(repo) == loop["delivered_commit"]
+    with EventStore(root / "daedalus.db") as store:
+        events = store.all_events()
+        ordered_types = (
+            "StepCommitted",
+            "GoalAuditCompleted",
+            "IndependentValidationRequired",
+            "IndependentValidationEvaluated",
+            "IndependentValidationAttested",
+            "DeliveryCompleted",
+            "RunCompleted",
+        )
+        positions = []
+        receipts = {}
+        for kind in ordered_types:
+            matching = [(index, event) for index, event in enumerate(events) if event.event_type == kind]
+            assert len(matching) == 1, kind
+            index, event = matching[0]
+            positions.append(index)
+            receipts[kind] = event
+        assert positions == sorted(positions)
+        request = receipts["IndependentValidationRequired"]
+        evaluation = receipts["IndependentValidationEvaluated"]
+        approval = receipts["IndependentValidationAttested"]
+        delivery = receipts["DeliveryCompleted"]
+        started = next(event for event in events if event.event_type == "RunStarted")
+        spec_approval = next(event for event in events if event.event_type == "SpecApproved")
+        assert spec_approval.payload["verified"]
+        assert approval.payload["validator_id"] != spec_approval.payload["owner_id"]
+        assert approval.payload["key_fingerprint"] != spec_approval.payload["key_fingerprint"]
+        assert approval.payload["verified"]
+        for key in ("run_id", "execution_id", "spec_digest", "commit"):
+            assert request.payload[key] == evaluation.payload[key] == delivery.payload[key]
+        assert request.payload["request_id"] == evaluation.payload["request_id"] == approval.payload["request_id"]
+        assert approval.payload["commit"] == delivery.payload["commit"] == loop["delivered_commit"]
+        assert delivery.payload["target_branch"] == started.payload["target_branch"] == "main"
+        assert delivery.payload["independent_validation_id"] == approval.payload["validation_id"]
+        assert receipts["GoalAuditCompleted"].payload["decision"] == "APPROVE"
+        assert receipts["GoalAuditCompleted"].payload["commit"] == loop["delivered_commit"]
+        assert not receipts["StepCommitted"].payload.get("owner_override")
+        run_id = request.payload["run_id"]
+        assert not store.approvals_for_run(run_id)
+        assert all(step["state"] == "COMMITTED" and step["attempt"] == 1 for step in store.list_steps(run_id))
+        assert not store.verify_sequences()
 
 
 def test_the_identity_required_error_names_the_spec_and_risk(tmp_path) -> None:

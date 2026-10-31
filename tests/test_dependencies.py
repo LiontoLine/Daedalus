@@ -320,7 +320,7 @@ def test_goal_audit_rechecks_cache_instead_of_trusting_original_gate(
             cached.write_bytes(b"changed after step gate")
             return original(*args, **kwargs)
 
-        monkeypatch.setattr("daedalus.application.goal_audit.audit_delivery", tamper_then_audit)
+        monkeypatch.setattr("daedalus.application.branch_repair.audit_delivery", tamper_then_audit)
         base = _git(git_repo, ["rev-parse", "main"], check=True).stdout.strip()
         result = owner.run()
         assert result.status != "COMPLETED"

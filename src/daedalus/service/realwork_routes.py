@@ -40,6 +40,21 @@ class CapabilityCycleRequest(BaseModel):
     max_calls: int = Field(default=108,ge=1,le=108)
 
 
+class DevelopmentReplayRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    confirm_paid_calls: bool = Field(default=False, strict=True)
+    confirm_known_task_replay: bool = Field(default=False, strict=True)
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    max_tokens: int = Field(default=90000, ge=1, le=90000)
+    max_calls: int = Field(default=18, ge=1, le=18)
+
+
+class FreshValidationRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    confirm_paid_calls: bool = Field(default=False, strict=True)
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 def realwork_router(state):
     router = APIRouter()
     root = state.settings.workspace.root_path / "realwork-evaluations"
@@ -451,6 +466,139 @@ def realwork_router(state):
             except DaedalusError:
                 row.update(status="ADMISSION_FAILED",finished_at=utc_now())
                 atomic_json(target/"job.json",row)
+                raise
+            return response
+
+    @router.post("/api/realwork-development-replays", status_code=202)
+    def development_replay(request: DevelopmentReplayRequest):
+        from daedalus.application.realwork import PROJECT
+        from daedalus.service.replay_admission import STUDY, admit_replay
+
+        if not request.confirm_paid_calls or not request.confirm_known_task_replay:
+            raise HTTPException(422, "explicit paid calls and known-task replay confirmations required")
+        with lock:
+            if state.dispatcher.busy_runs():
+                raise HTTPException(409, "another job is active")
+            marker = root / "replay-admissions" / (request.plan_sha256 + ".json")
+            if (marker.exists() or any((root / "replay-admissions").glob("*.json"))
+                    or any(root.glob("realwork_replay_*/job.json"))):
+                raise HTTPException(409, "known-task replay plan already admitted; no resume or repeat")
+            try:
+                context = admit_replay(DATA, PROJECT, root, request.plan_sha256)
+            except (ValueError, TypeError, KeyError, OSError, AttributeError, OverflowError):
+                raise HTTPException(409, "frozen replay evidence, shared budget, or native sandbox is invalid") from None
+            client = state.build_model_client("coder").for_profile("bounded_json")
+            if client.model != "deepseek-flash":
+                raise HTTPException(422, "fixed monetary guard requires saved deepseek-flash")
+            job_id = new_id("realwork_replay")
+            target = directory(job_id)
+            target.mkdir(parents=True)
+            row = {
+                "job_id": job_id, "study": STUDY, "status": "QUEUED",
+                "session_id": state.lifecycle.session_id, "created_at": utc_now(),
+                "automatic_resume": False, "planned_trials": len(context["cases"]),
+                "planned_case_ids": [case["case"] for case in context["cases"]],
+                "phase": context["phase"], "plan_sha256": request.plan_sha256,
+                "comparison_job_id": context["comparison_job_id"], "comparison_arm": "optimized",
+                "request": request.model_dump(), "budget_context": context["monetary_admission"],
+                "authorization": context["authorization"], "historical_budget": context["historical_budget"],
+                "scope": "known tasks reused for development replay; historical baseline only; "
+                         "no heldout, generalization, or causal claim",
+            }
+            # Persist consumption before dispatch, including failed/canceled admissions.
+            atomic_json(marker, {"plan_sha256": request.plan_sha256, "job_id": job_id,
+                                 "admitted_at": row["created_at"], "automatic_resume": False})
+            atomic_json(target / "job.json", row)
+            response = dict(row)
+
+            def execute():
+                row.update(status="RUNNING", started_at=utc_now())
+                atomic_json(target / "job.json", row)
+                try:
+                    report = run_realwork(
+                        target / "results", client, replay=context,
+                        max_tokens=request.max_tokens, max_calls=request.max_calls,
+                        stop_requested=lambda: stop_requested() or (target / "cancel.json").exists())
+                    row.update(status=report["status"],
+                               series_reported_tokens=report["series_reported_tokens"],
+                               series_logical_calls=report["series_logical_calls"])
+                except Exception as error:
+                    row.update(status="ERROR", error_type=type(error).__name__)
+                row["finished_at"] = utc_now()
+                atomic_json(target / "job.json", row)
+                return SimpleNamespace(status=row["status"])
+
+            try:
+                state.dispatcher.submit(job_id, str(target), execute)
+            except DaedalusError:
+                row.update(status="ADMISSION_FAILED", finished_at=utc_now())
+                atomic_json(target / "job.json", row)
+                raise
+            return response
+
+    @router.post("/api/realwork-validation-batches", status_code=202)
+    def fresh_validation(request: FreshValidationRequest):
+        from daedalus.application.realwork import (
+            PROJECT, VALIDATION_ARM_CALLS, VALIDATION_ARM_TOKENS, VALIDATION_CASES, VALIDATION_STUDY,
+        )
+        from daedalus.service.validation_admission import admit_validation
+
+        if not request.confirm_paid_calls:
+            raise HTTPException(422, "explicit paid calls confirmation required")
+        with lock:
+            if state.dispatcher.busy_runs():
+                raise HTTPException(409, "another job is active")
+            marker = root / "validation-admissions" / (request.plan_sha256 + ".json")
+            if (any((root / "validation-admissions").glob("*.json"))
+                    or any(root.glob("realwork_validation_*/job.json"))):
+                raise HTTPException(409, "fresh batch already consumed; no automatic resume or repeat")
+            try:
+                context = admit_validation(DATA, PROJECT, root, request.plan_sha256)
+            except (ValueError, TypeError, KeyError, OSError, AttributeError):
+                raise HTTPException(409, "fresh frozen plan, workload, source or isolation is invalid") from None
+            client = state.build_model_client("coder").for_profile("bounded_json")
+            if client.model != "deepseek-flash":
+                raise HTTPException(422, "paired study requires saved deepseek-flash")
+            job_id = new_id("realwork_validation")
+            target = directory(job_id)
+            target.mkdir(parents=True)
+            row = {
+                "job_id": job_id, "study": VALIDATION_STUDY, "status": "QUEUED",
+                "session_id": state.lifecycle.session_id, "created_at": utc_now(),
+                "automatic_resume": False, "planned_trials": 2 * VALIDATION_CASES,
+                "planned_case_ids": [case["case"] for case in context["cases"]],
+                "phase": context["phase"], "plan_sha256": request.plan_sha256,
+                "request": request.model_dump(), "authorization": context["authorization"],
+                "budget_context": None, "scope": "fresh single-agent versus current Daedalus; no causal claim",
+            }
+            atomic_json(marker, {"plan_sha256": request.plan_sha256, "job_id": job_id,
+                                 "admitted_at": row["created_at"], "automatic_resume": False})
+            atomic_json(target / "job.json", row)
+            response = dict(row)
+
+            def execute():
+                row.update(status="RUNNING", started_at=utc_now())
+                atomic_json(target / "job.json", row)
+                try:
+                    report = run_realwork(
+                        target / "results", client, cycle=context,
+                        max_tokens=2 * VALIDATION_CASES * VALIDATION_ARM_TOKENS,
+                        max_calls=2 * VALIDATION_CASES * VALIDATION_ARM_CALLS,
+                        stop_requested=lambda: stop_requested() or (target / "cancel.json").exists())
+                    row.update(status=report["status"],
+                               series_reported_tokens=report["series_reported_tokens"],
+                               series_logical_calls=report["series_logical_calls"])
+                except Exception as error:
+                    row.update(status="ERROR", error_type=type(error).__name__)
+                row["finished_at"] = utc_now()
+                atomic_json(target / "job.json", row)
+                return SimpleNamespace(status=row["status"])
+
+            try:
+                state.dispatcher.submit(job_id, str(target), execute)
+            except DaedalusError:
+                row.update(status="ADMISSION_FAILED", finished_at=utc_now())
+                atomic_json(target / "job.json", row)
                 raise
             return response
 

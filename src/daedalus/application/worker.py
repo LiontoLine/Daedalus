@@ -27,6 +27,7 @@ class WorkerContext:
     attempt: int
     revision_feedback: str = ""
     input_artifacts: tuple[Artifact, ...] = ()
+    repair_memory: tuple[dict[str, Any], ...] = ()
 
     @property
     def writable_paths(self) -> tuple[str, ...]:

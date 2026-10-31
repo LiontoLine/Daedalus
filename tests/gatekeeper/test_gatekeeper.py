@@ -8,6 +8,7 @@ fail-closed rules can be exercised precisely.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -287,6 +288,56 @@ def test_tier2_rejects_a_review_of_a_different_subject() -> None:
     result = Tier2Gate(reviewer=reviewer).review(_request())
     assert result.decision is GateDecision.ESCALATE
     assert result.fail_closed
+
+
+def test_tier2_rejects_approval_bound_to_a_different_execution_log() -> None:
+    original = replace(
+        _request(), execution_log="start\n" + "observation\n" * 300 + "old detail\nend\n"
+    )
+    changed = replace(original, execution_log=original.execution_log.replace("old detail", "new detail"))
+    reviewer = _StaticReviewer(
+        {
+            "decision": "APPROVE",
+            "subject_digest": original.subject_digest(),
+            "reasons": ["approval based on earlier observations"],
+            "violations": [],
+            "confidence": 1.0,
+        }
+    )
+    result = Tier2Gate(reviewer).review(changed)
+    assert result.decision is GateDecision.ESCALATE and result.fail_closed
+
+
+def test_tier2_checks_secrets_in_the_omitted_middle_of_an_execution_log() -> None:
+    log = "safe observation\n" * 200 + "sk-" + "a" * 30 + "\n" + "safe tail\n" * 200
+    reviewer = _StaticReviewer("must not be called")
+    result = Tier2Gate(reviewer).review(replace(_request(), execution_log=log))
+    assert result.decision is GateDecision.ESCALATE and result.fail_closed
+    assert result.failure_reason == "secret_in_payload"
+    assert reviewer.prompts == []
+
+
+@pytest.mark.parametrize("patch_chars", [24_000, 24_001])
+def test_tier2_never_dispatches_or_approves_a_partially_visible_patch(patch_chars) -> None:
+    reviewer = _StaticReviewer(
+        lambda digest: json.dumps(
+            {
+                "decision": "APPROVE",
+                "subject_digest": digest,
+                "reasons": ["controlled boundary probe"],
+                "violations": [],
+                "confidence": 1.0,
+            }
+        )
+    )
+    result = Tier2Gate(reviewer).review(replace(_request(), patch="+" * patch_chars))
+    if patch_chars == 24_000:
+        assert result.decision is GateDecision.APPROVE and not result.fail_closed
+        assert len(reviewer.prompts) == 1
+    else:
+        assert result.decision is GateDecision.ESCALATE and result.fail_closed
+        assert result.failure_reason == "review_context_overflow"
+        assert reviewer.prompts == []
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@
 | 目标 | 入口 |
 | --- | --- |
 | 理解用途、安装并运行离线演示 | [README.md](README.md) |
+| 查看最新修复、旧题验证与结果边界 | [CHANGELOG.md](CHANGELOG.md) |
 | 查找使用和架构文档 | [docs/README.md](docs/README.md) |
 | 配置本地模型连接 | [模型设置](docs/model-settings.md)与[凭证保存](docs/model-credential-storage.md) |
 | 启停服务、处理断点 | [服务控制](docs/service-control.md)与[运维手册](docs/runbook.md) |

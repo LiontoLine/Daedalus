@@ -6,6 +6,8 @@ or artifacts. This module is the single choke point that makes that claim testab
 
 from __future__ import annotations
 
+import ast
+import json
 import re
 from typing import Any
 
@@ -111,6 +113,8 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             # matching just `self._peek` in `token = self._peek()`.
             r"(?:[\"'][^\r\n\"']{8,}[\"']|"
             r"[^\s\"',;()\[\]{}]{8,}(?=$|[\s\"',;]))"
+            r"(?:[ \t]+(?:or|and)[ \t]+(?:[\"'][^\r\n\"']{8,}[\"']|"
+            r"[^\s\"',;()\[\]{}]{8,}(?=$|[\s\"',;])))*"
         ),
     ),
     (
@@ -137,16 +141,86 @@ def is_secret_key(name: str) -> bool:
     return upper.endswith(SECRET_KEY_SUFFIXES)
 
 
+def json_objects(text: str):
+    """Decode complete bounded JSON lines while retaining their original offsets."""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        value = line.rstrip("\r\n")
+        if value.lstrip().startswith(("{", "[")) and len(value) <= 131072:
+            try:
+                yield offset, offset + len(value), json.loads(value)
+            except (ValueError, RecursionError):
+                pass
+        offset += len(line)
+
+
+def is_symbolic_secret_reference(text: str, match: re.Match[str]) -> bool:
+    """Distinguish Python attribute reads from literal credential assignments.
+
+    Bare names, strings, comments and malformed source stay secret-shaped. A
+    fallback containing a literal is not exempt just because it starts with self.
+    """
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.end())
+    line = text[start:end if end >= 0 else len(text)]
+    stripped = line.lstrip()
+    if len(line) > 4096:
+        return False
+    column = len(line[:match.start() - start].encode()) - len(
+        line[:len(line) - len(stripped)].encode()
+    )
+
+    def reference(value):
+        if isinstance(value, ast.Attribute):
+            while isinstance(value, ast.Attribute):
+                value = value.value
+            return isinstance(value, ast.Name)
+        if isinstance(value, ast.BoolOp):
+            return all(reference(item) for item in value.values)
+        if isinstance(value, ast.Tuple) and len(value.elts) == 1:
+            return reference(value.elts[0])
+        return isinstance(value, ast.Constant) and value.value is None
+
+    try:
+        tree = ast.parse(stripped)
+    except (SyntaxError, RecursionError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, (ast.Name, ast.Attribute))
+                   and target.end_col_offset - len(match.group(1).encode()) == column
+                   for target in targets) and reference(node.value):
+                return True
+        elif isinstance(node, ast.keyword) and node.col_offset == column and reference(node.value):
+            return True
+    return False
+
+
 def redact_text(text: str) -> str:
     """Scrub value-shaped secrets from arbitrary text."""
     result = text
+    objects = list(json_objects(text))
+    if objects:
+        parts, offset = [], 0
+        for start, end, value in objects:
+            parts.append(redact_text(text[offset:start]))
+            scrubbed = redact(value)
+            parts.append(text[start:end] if scrubbed == value
+                         else json.dumps(scrubbed, ensure_ascii=False))
+            offset = end
+        parts.append(redact_text(text[offset:]))
+        return "".join(parts)
     for name, pattern in _PATTERNS:
         if name == "url_credentials":
             result = pattern.sub(lambda m: f"{m.group('scheme')}://{REDACTED}@", result)
         elif name == "bearer":
             result = pattern.sub(f"Bearer {REDACTED}", result)
         elif name == "key_value":
-            result = pattern.sub(lambda m: f"{m.group(1)}={REDACTED}", result)
+            result = pattern.sub(
+                lambda m, source=result: m.group(0) if is_symbolic_secret_reference(source, m)
+                else f"{m.group(1)}={REDACTED}", result
+            )
         else:
             result = pattern.sub(REDACTED, result)
     return result

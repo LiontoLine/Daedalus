@@ -7,20 +7,24 @@ COMMITTED step, never widen the spec, and share the parent's token budget.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 from typing import Any
 
 from daedalus.application.gatekeeper.decision import GateDecision
 from daedalus.application.gatekeeper.tier1 import Tier1Gate
-from daedalus.application.gatekeeper.tier2 import SemanticReviewRequest, Tier2Gate
+from daedalus.application.gatekeeper.tier2 import (
+    MAX_REVIEW_PATCH_CHARS,
+    SemanticReviewRequest,
+    Tier2Gate,
+)
 from daedalus.application.review_context import dependency_context
 from daedalus.domain.canonical import digest_of
 from daedalus.domain.ids import new_id
-from daedalus.domain.spec import AssertionKind, PlanNode, PlanSpec, RetryPolicy, SpecBundle
+from daedalus.domain.spec import AssertionKind, PlanNode
 from daedalus.infrastructure.git_sandbox import GitSandbox, _git
 
-MAX_GOAL_STAGES = 3  # includes the initial execution; distinct from step attempt budget
+MAX_GOAL_STAGES = 3  # initial execution plus at most two shared step/goal repair branches
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +122,7 @@ def audit_delivery(owner: Any, pool: Any, stage: int) -> dict[str, Any]:
             )
             return result
         patch = _git(owner.repo_path, ["diff", pool.base_commit, commit, "--"], check=True).stdout
-        if len(patch) > 24_000:
+        if len(patch) > MAX_REVIEW_PATCH_CHARS:
             result["reasons"] = [
                 "cumulative diff exceeds goal reviewer context; manual review required"
             ]
@@ -151,9 +155,10 @@ def audit_delivery(owner: Any, pool: Any, stage: int) -> dict[str, Any]:
                 box, tuple(files), query=owner.bundle.goal.objective + "\n" + patch
             ),
         )
-        owner.budget.check(
-            estimated=len(request.render()) // 3 + int(getattr(reviewer, "max_tokens", 2048))
+        result["review_reserve_tokens"] = (
+            len(request.render()) // 3 + int(getattr(reviewer, "max_tokens", 2048)) + 64
         )
+        owner.budget.check(estimated=result["review_reserve_tokens"])
         reviewed = Tier2Gate(reviewer=reviewer).review(request)
         owner.budget.check()
         result.update(
@@ -183,18 +188,20 @@ def audit_delivery(owner: Any, pool: Any, stage: int) -> dict[str, Any]:
         if not valid:
             result["reasons"] = ["goal reviewer omitted or malformed per-criterion evidence"]
             return result
-        result["semantic_criteria"] = rows
         from daedalus.application.requirement_evidence import valid_behavior_references
         if not valid_behavior_references(result["criteria"], rows):
             result["reasons"] = [
                 "goal reviewer omitted or mismatched frozen behavior receipt references"]
             return result
         statuses = {r["status"] for r in rows}
-        if "UNKNOWN" in statuses or (
-            reviewed.decision is GateDecision.APPROVE and statuses != {"MET"}
+        if (
+            "UNKNOWN" in statuses
+            or (reviewed.decision is GateDecision.APPROVE and statuses != {"MET"})
+            or (reviewed.decision is GateDecision.REVISE and "UNMET" not in statuses)
         ):
             result["reasons"] = ["goal reviewer evidence is uncertain or contradicts its verdict"]
             return result
+        result["semantic_criteria"] = rows
         result["decision"] = reviewed.decision.value
         return result
     except Exception as error:  # uncertainty must never approve delivery
@@ -245,166 +252,7 @@ def goal_audit_view(store: Any, run_id: str) -> dict[str, Any]:
         "includes_initial": True,
         "stages": stages,
         "iterations": scheduled,
-        "manual_reason": parked[-1].get("reason", "") if parked else "",
+        "stop_reason": parked[-1].get("reason", "") if parked else "",
     }
 
 
-def correction_bundle(bundle: SpecBundle, stage: int, feedback: str) -> SpecBundle:
-    """A versioned repair plan; the original goal and all authority stay identical.
-
-    Replaying every old node would reject unchanged, already-completed work. One
-    repair node gets the original declared outputs and must satisfy the ENTIRE goal.
-    New HIGH/CRITICAL plan digests still require their own owner approval.
-    """
-    artifacts = tuple(
-        sorted({path for node in bundle.plan.nodes for path in node.expected_artifacts})
-    )
-    tools = tuple(sorted({tool for node in bundle.plan.nodes for tool in node.allowed_tools}))
-    node = PlanNode(
-        node_id=f"goal-correction-{stage}",
-        objective=bundle.goal.objective,
-        intent=feedback,
-        expected_artifacts=artifacts,
-        allowed_tools=tools,
-        timeout_sec=min(
-            bundle.boundary.max_runtime_sec, max(n.timeout_sec for n in bundle.plan.nodes)
-        ),
-        retry_policy=RetryPolicy(
-            max_attempts=min(n.retry_policy.max_attempts for n in bundle.plan.nodes)
-        ),
-    )
-    updated = replace(
-        bundle,
-        plan=PlanSpec(
-            plan_id=f"{bundle.plan.plan_id}-stage-{stage}",
-            goal_id=bundle.goal.goal_id,
-            nodes=(node,),
-        ),
-        spec_version=bundle.spec_version + stage - 1,
-        parent_spec_digest=bundle.digest(),
-    )
-    updated.validate()
-    return updated
-
-
-def ensure_goal_delivery(owner: Any, pool: Any, result: Any) -> bool:
-    """Run bounded correction stages. Return true only for the exact audited head."""
-    from daedalus.application.orchestrator import RunOrchestrator
-
-    def record(kind: str, payload: dict[str, Any]) -> None:
-        owner.store.append(
-            aggregate_id=f"goal:{owner.run_id}",
-            execution_id=owner.execution_id,
-            event_type=kind,
-            actor="goal-auditor",
-            payload=payload,
-            correlation_id=owner.correlation_id,
-        )
-
-    def park(reason: str) -> bool:
-        record("GoalAuditEscalated", {"reason": reason, "max_stages": MAX_GOAL_STAGES})
-        owner.fsm.transition_run(
-            run_id=owner.run_id,
-            execution_id=owner.execution_id,
-            event_type="RunEscalated",
-            actor=owner.actor,
-            payload={"reason": reason, "source": "goal_audit"},
-            correlation_id=owner.correlation_id,
-        )
-        result.status = "AWAITING_APPROVAL"
-        result.notes.append(reason)
-        result.tokens_used = owner.budget.run_used
-        result.goal_audit = goal_audit_view(owner.store, owner.run_id)
-        return False
-
-    # A crash must not reset the stage budget or repeat a scheduled side effect. Explicit
-    # recovery/replay is required; this path never guesses what a child run already did.
-    if owner.store.events_for(f"goal:{owner.run_id}"):
-        return park("goal audit already has history; interrupted stages require manual recovery")
-    for stage in range(1, MAX_GOAL_STAGES + 1):
-        record("GoalAuditStarted", {"stage": stage, "commit": pool.integration_head()})
-        try:
-            reviewed = audit_delivery(owner, pool, stage)
-        except Exception as error:
-            return park(f"goal audit infrastructure failed: {type(error).__name__}: {error}")
-        record("GoalAuditCompleted", reviewed)
-        result.goal_audit = goal_audit_view(owner.store, owner.run_id)
-        if reviewed["decision"] == "APPROVE":
-            if pool.integration_head() != reviewed["commit"] or owner._execution_expired():
-                return park("audited commit changed or execution expired before delivery")
-            owner._goal_approved_commit = reviewed["commit"]
-            return True
-        if reviewed["decision"] != "REVISE":
-            return park("goal audit is inconclusive: " + "; ".join(reviewed["reasons"]))
-        if stage == MAX_GOAL_STAGES:
-            return park("goal remains unmet after 3 stages; automatic iteration stopped")
-        if owner._execution_expired():
-            return park("execution expired before another goal stage")
-        child_id = new_id("run")
-        feedback = (
-            "Goal audit requires correction without changing the goal or boundaries:\n"
-            + "\n".join(reviewed["required_changes"])
-        )
-        repair = correction_bundle(owner.bundle, stage + 1, feedback)
-        record(
-            "GoalStageStarted",
-            {
-                "stage": stage + 1,
-                "run_id": child_id,
-                "spec_digest": repair.digest(),
-                "base_commit": pool.integration_head(),
-                "feedback": feedback,
-            },
-        )
-        previous_recorder = owner.budget.on_record
-        try:
-            child = RunOrchestrator(
-                store=owner.store,
-                repo_path=owner.repo_path,
-                run_root=owner.run_root,
-                bundle=repair,
-                worker=owner.worker,
-                tier2=owner.tier2,
-                quota=owner.quota,
-                target_branch=pool.run_branch,
-                run_id=child_id,
-                correlation_id=owner.correlation_id,
-                parent_execution_id=owner.execution_id,
-                manual_review_levels=owner.manual_review_levels,
-                park_on_escalation=True,
-                require_spec_approval=owner.require_spec_approval,
-                identity=owner.identity,
-                sandbox_image=owner.sandbox_image,
-                retry_backoff_sec=owner.retry_backoff_sec,
-                retry_backoff_factor=owner.retry_backoff_factor,
-                retry_backoff_cap_sec=owner.retry_backoff_cap_sec,
-                sleeper=owner.sleeper,
-                execution_ttl_sec=owner.execution_ttl_sec,
-                goal_audit_enabled=False,
-                goal_stage_parent=owner.run_id,
-                goal_stage_number=stage + 1,
-                stage_feedback=feedback,
-            )
-            child.budget = owner.budget  # never reset the task-wide budget between stages
-            child.budget.on_record = child._record_model_usage
-            child.register_spec()
-            child.assert_spec_may_run()
-            child.create_run(base_ref=pool.run_branch)
-            child_result = child.run()
-        except Exception as error:
-            return park(f"correction stage interrupted: {type(error).__name__}: {error}")
-        finally:
-            owner.budget.on_record = previous_recorder
-        record(
-            "GoalStageFinished",
-            {
-                "stage": stage + 1,
-                "run_id": child_id,
-                "status": child_result.status,
-                "commit": child_result.promoted_commit,
-            },
-        )
-        result.commits.extend(child_result.commits)
-        if child_result.status != "COMPLETED" or not child_result.promoted_commit:
-            return park(f"correction stage {stage + 1} needs manual handling; run {child_id}")
-    return False

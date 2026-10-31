@@ -11,6 +11,7 @@ would have failed before the fix. The two that matter most:
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from daedalus.domain.spec import (
     RiskLevel,
     SpecBundle,
 )
+from daedalus.infrastructure.redact import REDACTED, redact_text
 from daedalus.infrastructure.store import EventStore
 from daedalus.model.base import Completion, Message
 from daedalus.security.outbound import (
@@ -72,6 +74,39 @@ def test_the_scanner_finds_credential_shapes_without_returning_values() -> None:
     assert findings and findings[0].kind == "openai_key"
     # The finding identifies the kind and count, never the value.
     assert FAKE_SECRET not in str([f.describe() for f in findings])
+
+
+@pytest.mark.parametrize("source", [
+    "self.secret = self.secret or settings.SECRET_KEY",
+    "    secret=self.secret,",
+    "build_token(secret=self.secret)",
+    "secret = settings.SECRET_KEY",
+])
+def test_computed_credential_references_are_not_literal_credentials(source):
+    assert scan_text(source) == ()
+    assert redact_text(source) == source
+    encoded = json.dumps({"candidate_sources": [{"text": source}]})
+    assert scan_text(encoded) == ()
+    assert redact_text(encoded) == encoded
+
+
+@pytest.mark.parametrize("source", [
+    'secret = "self.password"',
+    'secret = "literal-credential"',
+    'secret = unquoted_credential',
+    'secret = self.secret or "literal-credential"',
+    'secret = settings.SECRET_KEY and "literal-credential"',
+    '# secret = "literal-credential"',
+])
+def test_reference_handling_cannot_hide_literal_fallback_credentials(source):
+    assert any(f.kind == "key_value" for f in scan_text(source))
+    scrubbed = redact_text(source)
+    assert REDACTED in scrubbed
+    assert "literal-credential" not in scrubbed
+    assert "unquoted_credential" not in scrubbed
+    encoded = json.dumps({"text": source})
+    assert any(f.kind == "key_value" for f in scan_text(encoded))
+    assert REDACTED in redact_text(encoded)
 
 
 def test_only_added_lines_are_scanned() -> None:

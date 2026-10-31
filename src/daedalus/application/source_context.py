@@ -6,7 +6,53 @@ import ast
 import re
 
 
-def source_view(text: str, query: str, *, limit: int = 8000) -> str:
+def _caller_queries(tree: ast.Module, words: set[str]) -> list[str]:
+    """Find one syntactic local caller and argument producer, not an exhaustive proof."""
+    named_owners = {n.name for n in ast.walk(tree) if isinstance(n, ast.ClassDef)} & words
+    for owner in ast.walk(tree):
+        if not isinstance(owner, ast.ClassDef):
+            continue
+        methods = {n.name: n for n in owner.body
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        targets = methods.keys() & words
+        if named_owners and owner.name not in named_owners:
+            continue
+        for caller in methods.values():
+            for call in ast.walk(caller):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                        and isinstance(call.func.value, ast.Name)
+                        and call.func.value.id == "self" and call.func.attr in targets):
+                    continue
+                arguments = {n.id for arg in (*call.args, *(k.value for k in call.keywords))
+                             for n in ast.walk(arg) if isinstance(n, ast.Name)}
+                bindings = {}
+                for statement in caller.body:
+                    if statement.lineno >= call.lineno:
+                        break
+                    written = {n.id for n in ast.walk(statement)
+                               if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                    for name in written & arguments:
+                        # Conditional or nontrivial reassignment defeats this small resolver.
+                        bindings.pop(name, None)
+                        if isinstance(statement, ast.Assign):
+                            bindings[name] = statement.value
+                for producer in bindings.values():
+                    # A producer also named in the query still needs its own source window.
+                    if (isinstance(producer, ast.Call)
+                            and isinstance(producer.func, ast.Attribute)
+                            and isinstance(producer.func.value, ast.Name)
+                            and producer.func.value.id == "self"
+                            and producer.func.attr in methods
+                            and producer.func.attr != call.func.attr):
+                        return [f"{owner.name}.{producer.func.attr}",
+                                f"{owner.name}.{caller.name}"]
+    return []
+
+
+def source_view(
+    text: str, query: str, *, limit: int = 8000, fallback_query: str = "",
+    include_callers: bool = False,
+) -> str:
     """Keep exact source slices and their lines, prioritizing named Python symbols.
 
     Full-source secret checking belongs to the caller, before this lossy operation.
@@ -45,7 +91,25 @@ def source_view(text: str, query: str, *, limit: int = 8000) -> str:
     except (SyntaxError, RecursionError):
         tree = None
     if tree is not None:
+        if include_callers and limit >= 1200:
+            flow = _caller_queries(tree, words)
+            if flow:
+                primary = source_view(text, query, limit=limit // 4 - 50)
+                producer = source_view(text, flow[0], limit=limit // 2 - 50)
+                caller = source_view(text, flow[1], limit=limit // 4 - 50)
+                return (
+                    "FOCAL CURRENT SOURCE:\n" + primary
+                    + "\nARGUMENT PRODUCER " + flow[0] + ":\n" + producer
+                    + "\nLOCAL CALLER " + flow[1] + ":\n" + caller
+                )[:limit]
         classes = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+        named_methods = {
+            method
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name in words
+            for method in node.body
+            if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or (
                 isinstance(node, ast.ClassDef) and node.name in words
@@ -56,6 +120,9 @@ def source_view(text: str, query: str, *, limit: int = 8000) -> str:
                     )
                 )
                 priority = 1000 if isinstance(node, ast.ClassDef) else 2000
+                if node in named_methods:
+                    # Class-qualified queries must outrank unrelated same-name methods.
+                    priority = 3000
                 score = (priority if node.name in words else 0) + min(
                     30, len(identifiers & meaningful)
                 )
@@ -80,9 +147,19 @@ def source_view(text: str, query: str, *, limit: int = 8000) -> str:
                             ranked.append((-900, method.lineno, method))
                 pending = parents
     if not ranked:
+        if fallback_query:
+            return source_view(text, fallback_query, limit=limit)
         return "[TRUNCATED: source prefix only]\n" + text[: limit - 50]
     selected, remaining = set(), max(0, limit - 250)
     ordered = [node for _, _, node in sorted(ranked, key=lambda row: row[:2])[:6]]
+    registrations = [
+        n for n in tree.body
+        if isinstance(n, ast.Expr) and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Attribute)
+        and isinstance(n.value.func.value, ast.Name)
+        and n.value.func.value.id in words
+    ]
+    ordered = registrations[:4] + ordered
     ordered += [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))][:8]
     for node in ordered:
         indices = list(range(max(0, node.lineno - 3), node.end_lineno))
@@ -100,9 +177,11 @@ def source_view(text: str, query: str, *, limit: int = 8000) -> str:
                 isinstance(doc, ast.Expr)
                 and isinstance(doc.value, ast.Constant)
                 and isinstance(doc.value.value, str)
-                and len(doc.value.value) > 400
+                and len(doc.value.value) > 120
             ):
-                indices = [i for i in indices if not doc.lineno + 2 <= i < doc.end_lineno - 2]
+                # Keep the closing delimiter and following comments contiguous
+                # with the first statement, so edits can preserve the docstring.
+                indices = [i for i in indices if not doc.lineno - 1 <= i < doc.end_lineno - 1]
         fresh = [i for i in indices if i not in selected]
         if not fresh:
             continue

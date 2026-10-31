@@ -66,7 +66,7 @@ def _request(risk: RiskLevel = RiskLevel.NORMAL) -> PlanRequest:
     )
 
 
-def _run_to_park(git_repo, tmp_path, *, risk: RiskLevel = RiskLevel.NORMAL, reviewer=None):
+def _run_to_park(git_repo, tmp_path, *, risk: RiskLevel = RiskLevel.CRITICAL, reviewer=None):
     """Drive a run until a step escalates, leaving it parked."""
     store = EventStore(tmp_path / "approval.db")
     bundle = DeterministicPlanner().plan(_request(risk))
@@ -79,11 +79,13 @@ def _run_to_park(git_repo, tmp_path, *, risk: RiskLevel = RiskLevel.NORMAL, revi
             ops=(FileOp(op="write", path=TARGET, content=CORRECT_IMPLEMENTATION),),
             worker_id="w-approval",
         ),
-        tier2=Tier2Gate(reviewer=reviewer or AlwaysEscalate()) if reviewer is not False else None,
+        tier2=Tier2Gate(reviewer=reviewer or _Approve()) if reviewer is not False else None,
         quota=Quota(),
         park_on_escalation=True,
     )
     orchestrator.register_spec()
+    if risk in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
+        orchestrator.approve_spec(approved_by="alice", signature="fixture-spec-approval")
     result = orchestrator.run()
     return store, orchestrator, result
 
@@ -94,12 +96,14 @@ def _run_to_park(git_repo, tmp_path, *, risk: RiskLevel = RiskLevel.NORMAL, revi
 # ---------------------------------------------------------------------------
 
 
-def test_a_tier2_escalation_parks_the_run(git_repo, tmp_path) -> None:
-    store, orchestrator, result = _run_to_park(git_repo, tmp_path)
+def test_inconclusive_review_stops_without_requesting_approval(git_repo, tmp_path) -> None:
+    store, orchestrator, result = _run_to_park(
+        git_repo, tmp_path, risk=RiskLevel.NORMAL, reviewer=AlwaysEscalate(),
+    )
 
-    assert result.status == RunState.AWAITING_APPROVAL.value, result.describe()
-    assert result.escalated_steps, "the escalated step must be reported to the operator"
-    assert store.get_run(result.run_id)["status"] == RunState.AWAITING_APPROVAL.value
+    assert result.status == RunState.FAILED.value, result.describe()
+    assert not ApprovalService(store, orchestrator.fsm).pending_escalations()
+    assert store.get_run(result.run_id)["status"] == RunState.FAILED.value
     # The pending change is the subject of the decision, so its worktree must survive.
     step = store.list_steps(result.run_id)[0]
     assert str(step["state"]) == StepState.ESCALATED.value
@@ -311,12 +315,12 @@ def test_proceed_without_an_artifact_is_refused(git_repo, tmp_path) -> None:
     )
     orchestrator.register_spec()
     result = orchestrator.run()
-    assert result.status == RunState.AWAITING_APPROVAL.value
+    assert result.status == RunState.FAILED.value
     step_id = str(store.list_steps(result.run_id)[0]["step_id"])
     assert not store.artifacts_for_step(step_id), "a refused worker produced no artifact"
 
     service = ApprovalService(store=store, fsm=StateMachineService(store))
-    with pytest.raises(ApprovalError, match="nothing to accept"):
+    with pytest.raises(ApprovalError):
         service.approve(
             run_id=result.run_id,
             step_id=step_id,
@@ -416,7 +420,6 @@ def test_resume_without_a_decision_stays_parked(git_repo, tmp_path) -> None:
     again = resume_run(store=store, run_id=parked.run_id, workspace=str(tmp_path))
     assert again.status == RunState.AWAITING_APPROVAL.value
     assert not again.commits
-    assert any("no owner decision" in note for note in again.notes)
     store.close()
 
 

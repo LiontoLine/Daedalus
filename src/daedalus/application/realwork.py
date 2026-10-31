@@ -1,13 +1,17 @@
 """Frozen, native-host upstream issue evaluation using the actual Daedalus pipeline.
 
 Oracle localization is supplied equally to all arms; upstream gold/test patches
-are never present in solver worktrees. This is not an official SWE-bench score.
+are never present in solver worktrees. Explicit known-task development replay
+uses only the current Daedalus arm and a historical comparison, not a fresh score.
+This is not an official SWE-bench score.
 """
 from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import html
 from itertools import permutations
+import math
 import json
 from pathlib import Path
 import shutil
@@ -31,6 +35,10 @@ PROJECT = Path(__file__).resolve().parents[3]
 DATA = PROJECT / "external_data/realwork_20261027"
 EVIDENCE = PROJECT / "docs/realwork_validation_2026-10-27"
 ARMS = ("model", "single", "daedalus")
+VALIDATION_STUDY = "step-repair-validation-v1"
+VALIDATION_CASES = 6
+VALIDATION_ARM_TOKENS = 60000
+VALIDATION_ARM_CALLS = 12
 
 
 def catalog():
@@ -159,9 +167,41 @@ def _evaluate(repo, bundle, task, root, commit):
 
 
 def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_calls=144, continuation=None,
-                 optimization=False, contract_smoke=None, cycle=None):
+                 optimization=False, contract_smoke=None, cycle=None, replay=None):
+    if replay is not None:
+        if continuation is not None or optimization or contract_smoke is not None or cycle is not None:
+            raise ValueError("known-task replay cannot be combined with another realwork mode")
+        if (replay.get("study") != "known-task-development-replay-v1"
+                or replay.get("phase") != "known-task-replay"
+                or replay.get("comparison_arm") != "optimized"
+                or not replay.get("comparison_job_id")
+                or len(replay.get("plan_sha256", "")) != 64
+                or any(c not in "0123456789abcdef" for c in replay["plan_sha256"])):
+            raise ValueError("known-task replay requires its frozen plan and historical comparison")
+        selected = replay["cases"]
+        if not 1 <= len(selected) <= 3 or len({row["case"] for row in selected}) != len(selected):
+            raise ValueError("known-task replay requires one to three distinct frozen tasks")
+        money = replay["monetary_admission"]
+        amounts = [money[key] for key in (
+            "max_total_cost_cny", "prior_cost_upper_cny", "user_authorized_cap_cny",
+            "reserve_cny", "unknown_reserved_cost_cny")]
+        if (not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) for value in amounts)
+                or not 0 < money["max_total_cost_cny"] <= 1
+                or money["user_authorized_cap_cny"] != 1
+                or money["reserve_cny"] != 0
+                or money["unknown_reserved_cost_cny"] != 0
+                or not 0 <= money["prior_cost_upper_cny"] <= money["max_total_cost_cny"]):
+            raise ValueError("known-task replay requires the separately authorized one-CNY replay allowance")
+        authorization = replay.get("authorization", {})
+        if (authorization.get("scope") != "replay-only"
+                or authorization.get("max_cost_cny") != 1
+                or not isinstance(authorization.get("source"), str)
+                or not authorization["source"].strip()
+                or not replay.get("historical_budget")):
+            raise ValueError("known-task replay requires explicit authorization and separate historical provenance")
     destination.mkdir(parents=True)
-    selected = (cycle["cases"] if cycle else
+    selected = (replay["cases"] if replay is not None else cycle["cases"] if cycle else
                 json.loads((DATA / "diagnostics/fresh-smoke-cases.json").read_text()) if contract_smoke else
                 json.loads((PROJECT / "docs/failure_optimization_2026-10-27/cases.json").read_text())
                 if optimization else catalog())
@@ -171,8 +211,13 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
             raise ValueError("fixed check contains too many fresh tasks")
         for row in selected:
             admit_contract(row)
-    arms = ("daedalus",) if contract_smoke else ("single", "daedalus") if optimization else ARMS
+    arms = ("daedalus",) if replay is not None or contract_smoke else ("single", "daedalus") if optimization else ARMS
     efficiency = bool(cycle and cycle.get("study") in {"worker-efficiency-v1","worker-efficiency-v2"})
+    validation = bool(cycle and cycle.get("study") == VALIDATION_STUDY)
+    arm_tokens = VALIDATION_ARM_TOKENS if validation else 30000
+    arm_calls = VALIDATION_ARM_CALLS if validation else 6
+    if validation:
+        arms = ("single", "daedalus")
     worker_control = ModelWorker
     if efficiency:
         from daedalus.application.realwork_workers import baseline_worker
@@ -180,13 +225,16 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
             evidence_path=destination/"worker-control.py",
             revision="efficiency-v1" if cycle["study"]=="worker-efficiency-v2" else "poststudy")
         arms = ("baseline","optimized")
-    money_context = (cycle["monetary_admission"] if cycle else contract_smoke if contract_smoke else
+    money_context = (replay["monetary_admission"] if replay is not None else
+                     cycle["monetary_admission"] if cycle else contract_smoke if contract_smoke else
                      {"max_total_cost_cny":0.65, "prior_cost_upper_cny":0}
                      if optimization else continuation)
     if not selected:
         raise ValueError("qualified upstream cases have not been frozen")
-    token_ceiling=540000 if cycle else 1000000 if continuation else 300000
-    call_ceiling=240 if continuation else 144
+    token_ceiling = (2 * VALIDATION_CASES * VALIDATION_ARM_TOKENS if validation else
+                     90000 if replay is not None else 540000 if cycle else
+                     1000000 if continuation else 300000)
+    call_ceiling=18 if replay is not None else 240 if continuation else 144
     if not (1 <= max_tokens <= token_ceiling and 1 <= max_calls <= call_ceiling):
         raise ValueError("series cap exceeds the fixed release budget")
     remaining_keys={tuple(key) for key in continuation["remaining_keys"]} if continuation else None
@@ -196,22 +244,22 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
         "task_sha256": {r["case"]:hashlib.sha256((DATA/"tasks"/r["case"]/"task.json").read_bytes()).hexdigest() for r in selected},
         "model": client.model, "inference_profile": getattr(client, "inference_profile", "configured"),
         "arms": arms, "arm_order": "cyclic permutations, in frozen task order",
-        "max_tokens": max_tokens, "max_calls": max_calls, "max_tokens_per_arm": 30000,
+        "max_tokens": max_tokens, "max_calls": max_calls, "max_tokens_per_arm": arm_tokens,
         "budget_continuation":continuation,
-        "study": cycle.get("study", "capability-cycle-v1") if cycle else "contract-smoke-v1" if contract_smoke else "optimization-v1" if optimization else "upstream-v1",
+        "study": replay["study"] if replay is not None else cycle.get("study", "capability-cycle-v1") if cycle else "contract-smoke-v1" if contract_smoke else "optimization-v1" if optimization else "upstream-v1",
         "cycle": {k:v for k,v in cycle.items() if k not in {"cases","monetary_admission"}} if cycle else None,
         "monetary_admission": money_context,
-        "worker_settings": {"initial_output_tokens":2048 if (contract_smoke or cycle) else 4096 if optimization else 8192,
-                            "review_headroom_tokens":8192 if (optimization or contract_smoke or cycle) else 2048},
+        "worker_settings": {"initial_output_tokens":2048 if (replay is not None or contract_smoke or cycle) else 4096 if optimization else 8192,
+                            "review_headroom_tokens":8192 if (replay is not None or optimization or contract_smoke or cycle) else 2048},
         "public_reproductions": {r["case"]:r["public_reproduction"] for r in selected
                                  if r.get("public_reproduction")},
         "test_contracts": {r["case"]:r["test_contract"] for r in selected if r.get("test_contract")},
-        "max_calls_per_arm": 6, "repeats": 1,
+        "max_calls_per_arm": arm_calls, "repeats": 1,
         "price": {"currency": "CNY", "peak_input_per_million": 2, "peak_output_per_million": 8,
                   "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
-                  "checked": cycle.get("price_checked","2026-10-27") if cycle else "2026-10-27"},
+                  "checked": replay.get("price_checked", "2026-10-30") if replay is not None else cycle.get("price_checked","2026-10-27") if cycle else "2026-10-27"},
         "no_automatic_resume": True, "stop_on_unknown_usage": True,
-        "selection_rule_sha256": cycle["plan_sha256"] if cycle else hashlib.sha256((
+        "selection_rule_sha256": replay["plan_sha256"] if replay is not None else cycle["plan_sha256"] if cycle else hashlib.sha256((
             DATA/"diagnostics/fresh-smoke-cases.json" if contract_smoke else
             PROJECT/"docs/failure_optimization_2026-10-27/cases.json" if optimization
             else EVIDENCE/"selection-rule.json").read_bytes()).hexdigest(),
@@ -229,6 +277,30 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
             "all failures retained; no sealed tasks resumed or rerun",
             "native Seatbelt denies network and external writes, not host reads",
         ]
+    if validation:
+        protocol["scope"] = "fresh paired single-agent loop versus current Daedalus; native Django"
+        protocol["limitations"] = [
+            "One run per task and arm; not an old-versus-new implementation causal experiment",
+            "Same current worker, model, source tree, tests and resource bounds for both arms",
+            "All failures retained; no model-outcome-based task selection or paid reruns",
+            "Native Seatbelt denies network and external writes, not host reads",
+            "No monetary ceiling by explicit user authorization; token estimates are not billing guarantees",
+        ]
+    if replay is not None:
+        protocol["scope"] = "known-task development replay of reused oracle-localized tasks; historical comparison only"
+        protocol["phase"] = replay["phase"]
+        protocol["replay"] = {k:v for k,v in replay.items() if k not in {"cases", "monetary_admission"}}
+        protocol["arm_order"] = "current daedalus only, in original frozen task order"
+        protocol["limitations"] = [
+            "Previously used known tasks, explicitly authorized for development replay; not an independent score",
+            "Historical optimized arm is the comparison, not a concurrent baseline or causal control",
+            "No heldout-task, generalization, or causal improvement claim",
+            "Hidden oracle patches remain post-run evaluation only; no historical candidate patches supplied to the model",
+            "All new failures and stops retained; prior reports remain unchanged",
+            "Separately user-authorized replay-only ceiling of one CNY; not a spending target or automatic expansion",
+            "Historical spend and unknown-use reservations remain separate immutable provenance, not zero actual usage",
+            "Historical unknown-use reserves are not deducted again from the user-reported available balance",
+        ]
     protocol["sha256"] = hashlib.sha256(json.dumps(protocol,sort_keys=True).encode()).hexdigest()
     atomic_json(destination/"protocol.json", protocol)
     series = MeteredClient(client, max_calls, max_tokens)
@@ -245,6 +317,8 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
 
         def complete(self, messages, **options):
             nonlocal money_blocked, admission_count
+            if replay is not None and money_blocked:
+                raise ModelError("whole-study monetary admission reserve exhausted", request_not_dispatched=True)
             if stop_requested() or any(r.get("request_dispatched", True) and not r.get("usage_available", False) for r in series.records):
                 raise ModelError("series stopped or previous provider usage unknown", request_not_dispatched=True)
             if money_context:
@@ -259,8 +333,10 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
             # cannot erase the fact that a request may have reached the supplier.
             admission_path = None
             record_count = len(series.records)
-            if cycle and cycle.get("study") in {"capability-cycle-transport-v1","worker-efficiency-v1",
-                                                "worker-efficiency-v2"}:
+            if validation or replay is not None or (cycle and cycle.get("study") in {
+                    "capability-cycle-transport-v1", "worker-efficiency-v1", "worker-efficiency-v2"}):
+                if not money_context:
+                    prompt_bound = sum(len(m.content.encode("utf-8")) for m in messages) + 2048
                 admission_count += 1
                 admission_path = destination/"monetary-admissions"/f"request-{admission_count:03}.json"
                 admission = {
@@ -270,7 +346,7 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
                     "input_byte_bound":prompt_bound,"max_output_tokens":options.get("max_tokens",4096),
                     "reserved_cost_upper_cny":(prompt_bound*2+options.get("max_tokens",4096)*8)/1e6,
                     "known_prior_cost_cny":cost_upper(),
-                    "prior_budget_occupied_cny":money_context["prior_cost_upper_cny"],
+                    "prior_budget_occupied_cny": money_context["prior_cost_upper_cny"] if money_context else None,
                 }
                 atomic_json(admission_path,admission)
             try:
@@ -314,22 +390,24 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
             root = destination / f"trial-01-{case['case']}-{arm}"
             root.mkdir()
             started = time.monotonic()
-            metered = MeteredClient(Guarded(), 6, 30000)
+            metered = MeteredClient(Guarded(), arm_calls, arm_tokens)
             factory = worker_control if arm == "baseline" else ModelWorker
             worker = CountedWorker(factory(metered, budget=TokenBudget(
-                max_tokens_per_run=30000, max_tokens_per_step=30000),
-                initial_output_tokens=2048 if (contract_smoke or cycle) else 4096 if optimization else 8192,
-                review_headroom_tokens=8192 if (optimization or contract_smoke or cycle) else 2048,
+                max_tokens_per_run=arm_tokens, max_tokens_per_step=arm_tokens),
+                initial_output_tokens=2048 if (replay is not None or contract_smoke or cycle) else 4096 if optimization else 8192,
+                review_headroom_tokens=8192 if (replay is not None or optimization or contract_smoke or cycle) else 2048,
                 inspection_context=RepositoryInspector() if arm != "model" else None))
             outcome = {"status":"ERROR", "delivered":False, "manual_interventions":0}
             evaluated = {}
             error = None
             tree = None
             try:
-                repo, bundle, tree, task = _setup(case, root, 30000)
-                outcome = (_single_loop(repo,bundle,worker,root,30000,attempts=1 if arm=="model" else 3)
+                repo, bundle, tree, task = _setup(case, root, arm_tokens)
+                if validation and tree != case["initial_tree"]:
+                    raise ValueError("fresh workload source no longer matches its qualified tree")
+                outcome = (_single_loop(repo,bundle,worker,root,arm_tokens,attempts=1 if arm=="model" else 3)
                            if arm != "daedalus" and not efficiency else
-                           _daedalus(repo,bundle,worker,metered,root,30000))
+                           _daedalus(repo,bundle,worker,metered,root,arm_tokens))
                 evaluated = _evaluate(repo,bundle,task,root,outcome["candidate_commit"])
             except Exception as failure:
                 error = type(failure).__name__
@@ -363,5 +441,34 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
               "real_model_completions":sum(r["model_completions"] for r in rows),
               "scope":protocol["scope"], "limitations":protocol["limitations"],
               "series_reported_tokens":series.total, "series_logical_calls":len(series.records)}
+    if replay is not None:
+        report.update(
+            study=protocol["study"], phase=protocol["phase"], replay=protocol["replay"],
+            cases=protocol["cases"], task_sha256=protocol["task_sha256"],
+            selection_rule_sha256=protocol["selection_rule_sha256"],
+            implementation_sha256=protocol["implementation_sha256"],
+            monetary_admission=protocol["monetary_admission"],
+        )
     write_report(destination, report)
+    if replay is not None:
+        evidence = html.escape(json.dumps(redact(report), ensure_ascii=False, indent=2))
+        (destination / "report.html").write_text(
+            '<!doctype html><html lang="en"><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Daedalus known-task development replay</title>'
+            '<style>body{font:14px/1.6 system-ui;margin:24px}main{max-width:1100px;margin:auto}'
+            'pre{white-space:pre-wrap;overflow-wrap:anywhere}</style><main>'
+            '<h1>Known-task development replay — historical comparison only</h1>'
+            '<p>Previously used frozen tasks; current Daedalus arm only. The optimized '
+            'comparison is historical, not a concurrent baseline. This is not an '
+            'independent, heldout-task, generalization, or causal improvement score.</p>'
+            '<p>All failures and stops are retained. This run has a separately authorized '
+            'replay-only ceiling of one CNY, not a spending target. Historical spend and '
+            'unknown-use reservations remain immutable provenance, not zero actual usage '
+            'and not another deduction from the user-reported current balance.</p>'
+            '<p><a href="report.json">Complete report JSON</a> · '
+            '<a href="protocol.json">Frozen protocol and source manifest</a> · '
+            '<a href="trials.csv">Trial results CSV</a></p>'
+            f'<h2>Provenance and complete results</h2><pre>{evidence}</pre></main></html>'
+        )
     return report

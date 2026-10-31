@@ -76,3 +76,19 @@ must be reported separately from the offline suite.
 Before handing off a change to the FSM, the gate, the scheduler or the event store, run
 the full suite: those modules have adversarial tests that exist specifically to catch a
 relaxed invariant.
+
+### Task-result regression is separate from control-plane regression
+
+- A completed experiment is not a resolved task. Keep stopped, rejected and unsafe
+  deliveries open until the original issue checks, existing regression, required
+  gates and actual delivery all pass on an identified candidate.
+- Continue named failures on the same task before treating fresh tasks as evidence
+  that those failures were fixed. Preserve original scores; link development repair
+  iterations separately. Reused tasks are not an independent capability score.
+- For this local optimization, read
+  `external_data/realwork_20261027/diagnostics/task-closure-20261030/case-closure.json`
+  when present. Update it from real task receipts, never from unit-test counts.
+  This private research ledger is not a dependency of ordinary installation or use.
+- Preserve evidence types in memory: executed failures and historical passed checks
+  differ from a reviewer's unverified hypothesis. Neither is current approval.
+  Persisted logs are not automatically model context; verify what the worker received.

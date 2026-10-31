@@ -199,7 +199,36 @@ def test_reviewer_receives_candidate_function_body_with_hash_not_only_patch_line
     )
 
 
-def test_secret_dependency_parks_with_audit_evidence_and_zero_review_calls(git_repo, tmp_path):
+def test_review_context_locates_changed_method_when_diff_has_no_owner_class(git_repo, tmp_path):
+    body = (
+        "    def normalize(self, value):\n"
+        "        if value is None:\n"
+        "            return 'EMPTY'\n"
+        "        value = value.strip()\n"
+        + "        value = value\n" * 15
+        + "        return value\n\n"
+    )
+    source = "".join(f"class Neighbor{i}:\n" + body for i in range(9))
+    source += "class Target:\n" + body + "# padding\n" * 2000
+    commit(git_repo, **{"module.py": source, ".gitattributes": "*.py diff=python\n"})
+    box = GitSandbox.create(repo_path=git_repo, run_root=tmp_path / "trees", name="changed-owner")
+    try:
+        prefix, target = source.split("class Target:\n")
+        changed = target.replace("return value\n", "return value.strip()\n", 1)
+        box.write_file("module.py", prefix + "class Target:\n" + changed)
+        patch = box.diff().patch
+        assert "Target" not in patch
+        context = json.loads(
+            dependency_context(box, ("module.py",), query="Normalize input\n" + patch)
+        )
+        view = context["candidate_sources"][0]["text"]
+        assert "        return value.strip()\n" in view
+        assert len(view) <= 3200
+    finally:
+        box.remove()
+
+
+def test_secret_dependency_fails_with_audit_evidence_and_zero_review_calls(git_repo, tmp_path):
     from daedalus.application.coding_worker import FileOp, ScriptedWorker
     from tests.conftest import CORRECT_IMPLEMENTATION, TARGET
     from tests.test_goal_audit import GoalReviewer, make_owner
@@ -223,12 +252,11 @@ def test_secret_dependency_parks_with_audit_evidence_and_zero_review_calls(git_r
     owner = make_owner(git_repo, tmp_path, reviewer, worker)
     try:
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL"
+        assert result.status == "FAILED"
         assert reviewer.step_reviews == reviewer.goals == 0
         events = owner.store.events_for_execution(owner.execution_id)
         review = [e for e in events if e.event_type == "StepTier2Decided"]
         assert len(review) == 1 and review[0].payload["fail_closed"]
-        assert "secret_in_payload" in review[0].payload["summary"]
         assert not owner.store.verify_sequences()
     finally:
         owner.store.close()

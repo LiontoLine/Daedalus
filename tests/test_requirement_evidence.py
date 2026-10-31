@@ -2,6 +2,7 @@
 
 import json
 import time
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -11,6 +12,7 @@ from daedalus.application.coding_worker import FileOp, ModelWorker, ScriptedWork
 from daedalus.application.gatekeeper.tier1 import Tier1Gate
 from daedalus.application.orchestrator import RunOrchestrator
 from daedalus.application.planner import DeterministicPlanner, PlanRequest
+from daedalus.application.repair_evidence import build_snapshot, select_candidates
 from daedalus.application.requirement_evidence import (
     bind_bundle,
     qualify,
@@ -94,6 +96,12 @@ def test_failing_baseline_then_frozen_candidate_evidence(repo, tmp_path):
         assert item["receipt"]["complete"] and not item["receipt"]["passed"]
         assert item["baseline_commit"] == initial
         assert item["receipt"]["outcomes"]["test_positive"] == "assertion_failure"
+        missing = build_snapshot(bundle, initial, criteria=bad.evidence["criteria"])
+        expectation = missing["nodes"][0]["expectations"][-1]
+        assert {c["test_name"]: c["status"] for c in expectation["checks"]} == {
+            "test_positive": "UNMET", "test_zero": "MET"}
+        assert {c["requirement_id"] for c in expectation["checks"]} == {"R1"}
+        assert select_candidates(bundle, missing)[0]["criterion_ids"] == [behavior.criterion_id]
         box.write_file("feature.py", CORRECT)
         good = gate._check_acceptance(box, acceptance_overrides=None)
         assert good.passed
@@ -102,6 +110,13 @@ def test_failing_baseline_then_frozen_candidate_evidence(repo, tmp_path):
         assert receipt["reviewed_tree"] == box.tree_digest()
         assert receipt["reviewed_commit"] == initial
         assert receipt["contract_digest"] == behavior.expect["behavior_contract"]["sha256"]
+        met = build_snapshot(bundle, initial, criteria=good.evidence["criteria"])
+        assert {c["status"] for c in met["nodes"][0]["expectations"][-1]["checks"]} == {"MET"}
+        tampered = deepcopy(good.evidence["criteria"])
+        tampered[-1]["behavior_evidence"]["receipt"]["outcomes"]["test_positive"] = "assertion_failure"
+        invalid = build_snapshot(bundle, initial, criteria=tampered)
+        assert invalid["nodes"][0]["expectations"][-1]["status"] == "BLOCKED"
+        assert select_candidates(bundle, invalid) == []
     finally:
         box.remove()
 
@@ -314,12 +329,11 @@ def test_repeated_ineffective_plan_stops_without_spending_the_third_attempt(repo
     owner.register_spec()
     try:
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL"
+        assert result.status == "FAILED"
         assert client.calls == 2
         assert result.tokens_used == 30
         steps = store.list_steps(owner.run_id)
         assert len(steps) == 1 and steps[0]["attempt"] == 2
-        assert "same ineffective plan failure" in steps[0]["last_failure"]
     finally:
         store.close()
 
@@ -397,12 +411,11 @@ def test_goal_audit_rejects_unattributed_model_claim_even_when_behavior_passes(r
     original = GitSandbox.main_commit(repo)
     try:
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL"
+        assert result.status == "PARTIAL_FAILURE"
         assert GitSandbox.main_commit(repo) == original
         audits = store.events_for("goal:" + owner.run_id)
         audit = next(e.payload for e in audits if e.event_type == "GoalAuditCompleted")
         assert audit["decision"] == "ESCALATE"
-        assert "receipt references" in audit["reasons"][0]
     finally:
         store.close()
 

@@ -59,7 +59,7 @@ class WorktreePool:
             _git(self.repo_path, ["branch", self.run_branch, self.base_commit], check=True)
 
     # ------------------------------------------------------------------ lifecycle
-    def acquire(self, step_id: str, *, base_commit: str = "") -> GitSandbox:
+    def acquire(self, step_id: str, *, base_commit: str = "", attempt: int = 1) -> GitSandbox:
         """Check out a worktree for one step from an exact commit."""
         if step_id in self._live:
             return self._live[step_id]
@@ -72,6 +72,7 @@ class WorktreePool:
             )
         base = base_commit or self.integration_head()
         name = f"{self.run_id}/{_safe_slug(step_id)}"
+        name += f"/attempt-{attempt}"
         sandbox = GitSandbox.create_from(
             repo_path=self.repo_path,
             run_root=self.run_root,

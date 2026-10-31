@@ -30,7 +30,9 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from daedalus import __version__
-from daedalus.application.approvals import ApprovalError, ApprovalService, NotEscalated
+from daedalus.application.approvals import (
+    ApprovalError, ApprovalService, NotEscalated, execution_authorization_required,
+)
 from daedalus.application.backup import BackupError, create_backup, list_backups, restore_backup
 from daedalus.application.coding_worker import ModelWorker
 from daedalus.application.execution_log import execution_log_ref
@@ -51,6 +53,7 @@ from daedalus.application.planner import DeterministicPlanner, ModelPlanner, Pla
 from daedalus.application.recovery import recover_workspace
 from daedalus.application.replay import ReplayService, classify_spec_change, run_repo_path
 from daedalus.application.resume import ResumeError, load_manifest, resume_run
+from daedalus.application.trunk_view import trunk_view
 from daedalus.config import ConfigError, Settings, load_settings
 from daedalus.domain.approval import ApprovalDecision
 from daedalus.domain.spec import MetaSpec, NetworkPolicy, RiskLevel, SpecBundle
@@ -504,9 +507,13 @@ def create_app(
             "application/gatekeeper/tier2.py",
             "application/gatekeeper/tier1.py",
             "application/orchestrator.py", "application/intake.py",
-            "application/inspection.py",
+            "application/approvals.py", "application/worktree_pool.py",
+            "application/inspection.py", "application/route.py",
             "application/review_context.py", "application/gatekeeper/pipeline.py",
             "application/goal_audit.py",
+            "application/repair_evidence.py", "application/trunk_view.py",
+            "application/branch_repair.py", "domain/events.py",
+            "application/commit_recovery.py",
             "application/engineering_cases.py", "service/engineering_routes.py",
             "service/static/engineering.js", "service/static/engineering.css",
             "service/templates/_engineering_evaluation.html",
@@ -520,6 +527,8 @@ def create_app(
             "service/static/review-evaluation.js", "service/static/access-handoff.js",
             "service/templates/_review_evaluation.html",
             "application/realwork.py", "service/realwork_routes.py",
+            "service/capability_budget.py", "service/replay_admission.py",
+            "service/validation_admission.py",
             "application/source_context.py", "infrastructure/retrieval_tools.py",
             "application/upstream_contract.py",
             "application/native_verifier.py",
@@ -902,6 +911,7 @@ def create_app(
                                     "updated_at", "granted_attempts", "run_id",
                                     "execution_id")},
             "result_commit": result_commit,
+            "execution_authorization_required": execution_authorization_required(_store(), step_id),
             "gates": [
                 {
                     "tier": int(row["tier"]),
@@ -923,14 +933,23 @@ def create_app(
             "approvals": _store().approvals_for_step(step_id),
         }
 
+    @app.get("/api/runs/{run_id}/trunk")
+    def run_trunk(run_id: str) -> dict[str, Any]:
+        """Recorded trunk evidence and isolated branch history, without running checks."""
+        _run_or_404(run_id)
+        return trunk_view(_store(), run_id)
+
     @app.get("/api/runs/{run_id}/plan")
     def plan_graph(run_id: str) -> dict[str, Any]:
         """The DAG with each node's live state, for the console's graph view."""
         bundle = _bundle_for(run_id)
         steps = {str(step["node_id"]): step for step in _store().list_steps(run_id)}
+        trunk = trunk_view(_store(), run_id)
+        expectations = {node["node_id"]: node for node in trunk["nodes"]}
         nodes = []
         for node in bundle.plan.nodes:
             step = steps.get(node.node_id)
+            evidence = expectations.get(node.node_id, {})
             nodes.append(
                 {
                     "node_id": node.node_id,
@@ -938,11 +957,20 @@ def create_app(
                     "intent": node.intent,
                     "deps": list(node.deps),
                     "expected_artifacts": list(node.expected_artifacts),
+                    "acceptance_criteria": [
+                        criterion.to_dict() for criterion in (
+                            node.acceptance_criteria or bundle.goal.acceptance_criteria
+                        )
+                    ],
                     "retry_max_attempts": node.retry_policy.max_attempts,
                     "timeout_sec": node.timeout_sec,
                     "state": str(step["state"]) if step else "NOT_DECLARED",
                     "attempt": int(step["attempt"]) if step else 0,
                     "step_id": str(step["step_id"]) if step else "",
+                    "expectation_status": evidence.get("status"),
+                    "expectation_score": evidence.get("score"),
+                    "expectations": evidence.get("expectations", []),
+                    "expectation_commit": evidence.get("commit", ""),
                 }
             )
         return {
@@ -951,6 +979,7 @@ def create_app(
             "risk_level": bundle.goal.risk_level.value,
             "topological_order": list(bundle.plan.topo_order()),
             "nodes": nodes,
+            "trunk": trunk,
             "edges": [
                 {"from": dep, "to": node.node_id}
                 for node in bundle.plan.nodes

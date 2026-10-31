@@ -26,7 +26,11 @@ import re
 from dataclasses import dataclass
 
 from daedalus.errors import DaedalusError
-from daedalus.infrastructure.redact import _PATTERNS  # noqa: PLC2701 - the pattern list is the source
+from daedalus.infrastructure.redact import (
+    _PATTERNS,
+    is_symbolic_secret_reference,
+    json_objects,
+)
 
 
 class SecretInPayload(DaedalusError):
@@ -55,14 +59,33 @@ _ADDED_LINE = re.compile(r"^\+(?!\+\+)")
 
 def scan_text(text: str) -> tuple[SecretFinding, ...]:
     """Find credential shapes in arbitrary text. Reports kinds, never values."""
-    findings: list[SecretFinding] = []
+    objects = list(json_objects(text))
+    findings: dict[str, SecretFinding] = {}
     for name, pattern in _PATTERNS:
-        matches = list(pattern.finditer(text))
-        if not matches:
-            continue
-        line = text.count("\n", 0, matches[0].start()) + 1
-        findings.append(SecretFinding(kind=name, count=len(matches), sample_line=line))
-    return tuple(findings)
+        matches = [match for match in pattern.finditer(text)
+                   if not any(start <= match.start() < end for start, end, _ in objects)
+                   and (name != "key_value" or not is_symbolic_secret_reference(text, match))]
+        if matches:
+            line = text.count("\n", 0, matches[0].start()) + 1
+            findings[name] = SecretFinding(kind=name, count=len(matches), sample_line=line)
+    for start, _, value in objects:
+        line = text.count("\n", 0, start) + 1
+        pending = [value]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, dict):
+                pending.extend(item.keys())
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
+            elif isinstance(item, str):
+                for finding in scan_text(item):
+                    previous = findings.get(finding.kind)
+                    findings[finding.kind] = SecretFinding(
+                        kind=finding.kind, count=finding.count + (previous.count if previous else 0),
+                        sample_line=min(line, previous.sample_line) if previous else line,
+                    )
+    return tuple(findings[name] for name, _ in _PATTERNS if name in findings)
 
 
 def scan_added_lines(patch: str) -> tuple[SecretFinding, ...]:

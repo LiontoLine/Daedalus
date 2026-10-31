@@ -841,8 +841,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
             print(f"  stage {stage['stage']}      : {stage['decision']} scope={stage['scope']} commit={stage['commit'][:12]}")
             for change in stage.get("required_changes", []):
                 print(f"    required   : {change}")
-        if goal_report["manual_reason"]:
-            print(f"  manual       : {goal_report['manual_reason']}")
+        if goal_report["stop_reason"]:
+            print(f"  stop reason  : {goal_report['stop_reason']}")
         for event in store.events_for_execution(str(run["execution_id"])):
             if event.event_type in {"StepCommitted", "SpecRegistered", "RunCompleted"}:
                 print(f"event          : {event.timestamp} {event.event_type} {event.actor}")

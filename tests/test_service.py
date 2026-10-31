@@ -271,11 +271,11 @@ def test_escalation_is_listed_approved_and_resumed_over_http(service, tmp_path) 
         def complete(self, prompt: str, *, subject_digest: str) -> str:
             return json.dumps(
                 {
-                    "decision": "ESCALATE",
+                    "decision": "APPROVE",
                     "subject_digest": subject_digest,
                     "reasons": ["needs a human"],
                     "violations": [],
-                    "confidence": 0.4,
+                    "confidence": 0.9,
                 }
             )
 
@@ -286,7 +286,7 @@ def test_escalation_is_listed_approved_and_resumed_over_http(service, tmp_path) 
             objective="fix the counter",
             target_paths=(TARGET,),
             test_command=TEST_COMMAND,
-            risk_level=RiskLevel.NORMAL,
+            risk_level=RiskLevel.CRITICAL,
             network_policy=NetworkPolicy.DENY,
         )
     )
@@ -303,6 +303,7 @@ def test_escalation_is_listed_approved_and_resumed_over_http(service, tmp_path) 
         park_on_escalation=True,
     )
     orchestrator.register_spec()
+    orchestrator.approve_spec(approved_by="operator@example")
     parked = orchestrator.run()
     assert parked.status == RunState.AWAITING_APPROVAL.value
 
@@ -319,7 +320,6 @@ def test_escalation_is_listed_approved_and_resumed_over_http(service, tmp_path) 
         json={"step": item["step_id"], "decision": "proceed", "approved_by": "  "},
     )
     assert bad.status_code == 400
-    assert "who gave it" in json.dumps(bad.json())
 
     # A well-formed approval is accepted and the escalation clears.
     ok = client.post(

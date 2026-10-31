@@ -210,7 +210,7 @@ def test_legacy_chat_client_uses_the_same_ca_policy(monkeypatch):
 
 
 @pytest.mark.parametrize("configuration_error", [True, False])
-def test_certificate_fault_parks_real_execution_without_retry_or_commit(
+def test_certificate_fault_fails_real_execution_without_retry_or_commit(
     git_repo, tmp_path, monkeypatch, configuration_error
 ):
     calls = []
@@ -242,7 +242,7 @@ def test_certificate_fault_parks_real_execution_without_retry_or_commit(
         )
         orchestrator.register_spec()
         result = orchestrator.run()
-        assert result.status == "AWAITING_APPROVAL", result.describe()
+        assert result.status == "FAILED", result.describe()
         assert len(calls) == 1
         assert len(result.steps) == 1
         assert result.steps[0].state == "ESCALATED" and result.steps[0].attempt == 1

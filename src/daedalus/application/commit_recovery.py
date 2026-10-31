@@ -240,7 +240,10 @@ def _check_delivery(store, run, repo, *, apply):
         "integration head changed after delivery intent",
     )
     if value.get("goal_audit_enabled"):
-        goals = store.events_for("goal:" + rid)
+        goals = [
+            event for event in store.events_for("goal:" + rid)
+            if event.event_type != "GoalTrunkSnapshot"
+        ]
         _require(
             goals
             and goals[-1].event_type == "GoalAuditCompleted"

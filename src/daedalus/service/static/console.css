@@ -756,6 +756,25 @@ body[data-page="execution"] footer { display: none; }
 .evidence-disclosure summary { cursor: pointer; color: var(--ink-faint); padding: 13px 0; }
 .evidence-disclosure .inspector-facts { grid-template-columns: 90px minmax(0,1fr); }
 .evidence-disclosure code { font-size: 9px; word-break: break-all; }
+.expectation-state { display: inline-block; font-size: 10px; line-height: 1.6; font-weight: 600; }
+.expectation-MET { color: #91d9b3; fill: #91d9b3; }
+.expectation-UNMET { color: #ffaaa4; fill: #ffaaa4; }
+.expectation-UNKNOWN { color: #b5c4da; fill: #b5c4da; }
+.expectation-BLOCKED { color: #f0cd85; fill: #f0cd85; }
+.expectation-STALE { color: #d1b2ee; fill: #d1b2ee; }
+.lane-expectation { font: 9px var(--sans); }
+.expectation-evidence { border-top: 1px solid var(--line-soft); padding-top: 3px; margin: 16px 0; }
+.expectation-disclaimer { font-size: 10px; line-height: 1.8; color: var(--ink-dim); overflow-wrap: anywhere; }
+.expectation-criteria { list-style: none; padding: 0; margin: 10px 0; font-size: 11px; }
+.expectation-criteria li { padding: 10px 0; border-bottom: 1px solid var(--line-soft); overflow-wrap: anywhere; }
+.expectation-criteria strong { margin-left: 6px; font: 10px var(--mono); }
+.expectation-criteria p { margin: 6px 0; line-height: 1.8; }
+.expectation-criteria summary, .repair-branch summary { cursor: pointer; color: var(--ink-dim); font-size: 10px; margin-top: 8px; }
+.expectation-criteria pre, .repair-branch pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; max-height: 220px; overflow: auto; }
+.repair-branch { border-left: 2px solid #7e99c5; padding: 10px; margin: 8px 0; overflow-wrap: anywhere; }
+.repair-REJECTED { border-color: #ffaaa4; }.repair-PROMOTED { border-color: #91d9b3; }
+.repair-branch strong { font-size: 10px; }.repair-branch p { margin: 6px 0; }
+.trunk-summary { border-top: 1px solid var(--line-soft); margin-top: 16px; }
 .file-entry { display: flex; align-items: flex-start; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); font: 10px/1.7 var(--mono); overflow-wrap: anywhere; }
 .file-entry::before { content: '↳'; color: var(--ink-faint); }
 .inspector-scroll .checks { display: block; }.inspector-scroll .check { font-size: 10px; margin-bottom: 8px; }.inspector-scroll .gate-head { margin-top: 18px; font-size: 11px; }

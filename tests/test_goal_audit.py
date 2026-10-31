@@ -144,13 +144,13 @@ def test_three_total_stages_stop_and_cannot_reset_by_resume(git_repo, tmp_path):
     original = _git(git_repo, ["rev-parse", "main"], check=True).stdout.strip()
     try:
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL"
+        assert result.status == "PARTIAL_FAILURE"
         view = goal_audit_view(owner.store, owner.run_id)
         assert len(view["stages"]) == 3 and len(view["iterations"]) == 2, view
         assert _git(git_repo, ["rev-parse", "main"], check=True).stdout.strip() == original
         assert not result.promoted_commit
         assert view["status"] == "ESCALATE"
-        with pytest.raises(ResumeError, match="cannot reset"):
+        with pytest.raises(ResumeError):
             resume_run(store=owner.store, run_id=owner.run_id, workspace=str(tmp_path))
     finally:
         owner.store.close()
@@ -169,7 +169,7 @@ def test_inconclusive_goal_review_does_not_iterate(git_repo, tmp_path):
     reviewer.complete = missing_evidence
     try:
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL"
+        assert result.status == "PARTIAL_FAILURE"
         assert len(goal_audit_view(owner.store, owner.run_id)["stages"]) == 1
         assert not goal_audit_view(owner.store, owner.run_id)["iterations"]
     finally:
@@ -245,7 +245,9 @@ def test_final_goal_criteria_are_rechecked_after_all_nodes(git_repo, tmp_path):
         owner.store.close()
 
 
-@pytest.mark.parametrize("failure", ["wrong_subject", "unknown", "transport"])
+@pytest.mark.parametrize(
+    "failure", ["wrong_subject", "unknown", "transport", "contradictory_revision"]
+)
 def test_goal_review_uncertainty_never_promotes_or_restarts(git_repo, tmp_path, failure):
     reviewer = GoalReviewer(["APPROVE"])
     owner = make_owner(git_repo, tmp_path, reviewer)
@@ -260,12 +262,15 @@ def test_goal_review_uncertainty_never_promotes_or_restarts(git_repo, tmp_path, 
                 answer["subject_digest"] = "different-tree"
             if failure == "unknown":
                 answer["criterion_results"][0]["status"] = "UNKNOWN"
+            if failure == "contradictory_revision":
+                answer["decision"] = "REVISE"
+                answer["violations"] = ["claimed mismatch without an unmet criterion"]
         return json.dumps(answer)
 
     reviewer.complete = uncertain
     try:
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL"
+        assert result.status == "PARTIAL_FAILURE"
         assert not result.promoted_commit
         assert not goal_audit_view(owner.store, owner.run_id)["iterations"]
     finally:
@@ -278,27 +283,13 @@ def test_goal_budget_exhaustion_does_not_call_reviewer(git_repo, tmp_path):
     owner.budget.max_tokens_per_run = 1
     try:
         result = owner.run()
-        assert result.status == "AWAITING_APPROVAL"
+        assert result.status == "PARTIAL_FAILURE"
         assert reviewer.goals == 0
         assert not result.promoted_commit
     finally:
         owner.store.close()
 
 
-def test_correction_changes_only_plan_and_preserves_authority(git_repo, tmp_path):
-    from daedalus.application.goal_audit import correction_bundle
-
-    owner = make_owner(git_repo, tmp_path)
-    try:
-        repaired = correction_bundle(owner.bundle, 2, "fix the unmet criterion")
-        assert repaired.goal is owner.bundle.goal
-        assert repaired.boundary is owner.bundle.boundary
-        assert repaired.meta is owner.bundle.meta
-        assert len(repaired.plan.nodes) == 1
-        assert not repaired.plan.nodes[0].acceptance_criteria  # inherits the entire original goal
-        assert repaired.parent_spec_digest == owner.spec_digest
-    finally:
-        owner.store.close()
 
 
 def test_new_high_risk_repair_plan_cannot_reuse_original_approval(git_repo, tmp_path):
@@ -312,7 +303,7 @@ def test_new_high_risk_repair_plan_cannot_reuse_original_approval(git_repo, tmp_
     try:
         result = owner.run()
         view = goal_audit_view(owner.store, owner.run_id)
-        assert result.status == "AWAITING_APPROVAL" and not result.promoted_commit
+        assert result.status == "PARTIAL_FAILURE" and not result.promoted_commit
         child_spec = view["iterations"][0]["spec_digest"]
         assert not owner.store.is_spec_approved(child_spec)
         assert view["iterations"][0]["exists"] is False

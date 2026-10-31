@@ -252,7 +252,12 @@ function renderEscalations(steps, run) {
   const panel = $("#escalation-panel");
   const body = $("#escalation-body");
   if (!panel || !body) return;
-  const escalated = steps.filter((step) => step.state === "ESCALATED");
+  if (run.status !== "AWAITING_APPROVAL") {
+    panel.hidden = true;
+    body.innerHTML = "";
+    return;
+  }
+  const escalated = steps.filter((step) => step.execution_authorization_required === true);
   if (!escalated.length) { panel.hidden = true; return; }
   panel.hidden = false;
 
@@ -1026,7 +1031,7 @@ const STATE_SKIN = {
 const STATE_TEXT = {
   NOT_DECLARED: "待调度", COMMITTED: "已提交", TIER1_PASSED: "tier-1 通过", AWAITING_GATEKEEPER: "门禁中",
   TIER2_REVIEWING: "审查中", APPROVED: "已批准", COMMITTING: "提交中", RUNNING: "执行中",
-  LEASED: "已租用", READY: "就绪", PENDING: "待处理", REVISE: "被打回", ESCALATED: "等待人工",
+  LEASED: "已租用", READY: "就绪", PENDING: "待处理", REVISE: "待修复", ESCALATED: "执行受阻",
   STALE: "已失效", LOST: "租约丢失", FAILED: "失败", TIMEOUT: "超时", CANCELLED: "已取消",
   SUPERSEDED: "已取代",
 };
@@ -1066,6 +1071,8 @@ function buildStepModels(detail, route, plan = null) {
     };
     return {
       index: index + 1, step, plan: definition, declared,
+      repairBranches: ((plan && plan.trunk && plan.trunk.branches) || [])
+        .filter((branch) => branch.node_id === id || (branch.affected_node_ids || []).includes(id)),
       attempts: (attemptsByNode.get(id) || []).slice().sort((a, b) => a.attempt - b.attempt),
       artifact: (step.artifacts || []).slice(-1)[0] || null,
       gate: (step.gates || []).slice(-1)[0] || null,
@@ -1213,6 +1220,66 @@ function nodeLabel(value, maxWidth = 194) {
   return result;
 }
 
+const EXPECTATION_STATES = new Set(["MET", "UNMET", "UNKNOWN", "BLOCKED", "STALE"]);
+
+function expectationState(value) {
+  return EXPECTATION_STATES.has(value) ? value : "UNKNOWN";
+}
+
+function expectationBadge(plan) {
+  if (!plan || !plan.expectation_status) return "";
+  const state = expectationState(plan.expectation_status);
+  const score = typeof plan.expectation_score === "number" && Number.isFinite(plan.expectation_score)
+    ? ` · ${Math.round(Math.min(1, Math.max(0, plan.expectation_score)) * 100)}% 证据覆盖` : "";
+  return `<span class="expectation-state expectation-${state}" title="Evidence coverage only; not correctness probability or permission to deliver.">预期 ${state}${escapeHtml(score)}</span>`;
+}
+
+function renderExpectationEvidence(plan) {
+  if (!plan || !plan.expectation_status) return "";
+  return `<section class="expectation-evidence" aria-label="冻结预期与当前证据"><h3>冻结预期 · 当前主干证据</h3>`
+    + expectationBadge(plan)
+    + '<p class="expectation-disclaimer">证据覆盖率不是正确概率，也不代表交付许可。Evidence coverage only.</p>'
+    + `<p class="inspector-caption">证据提交 ${hashCell(plan.expectation_commit)}</p>`
+    + '<ul class="expectation-criteria">' + (plan.expectations || []).map((row) => {
+      const state = expectationState(row.status);
+      const evidence = row.evidence || {};
+      const rows = Array.isArray(evidence.rows) ? evidence.rows : [];
+      return `<li><span class="expectation-state expectation-${state}">${state}</span> `
+        + `<strong>${escapeHtml(row.criterion_id || "")}</strong><p>${escapeHtml(row.statement || row.command || row.path || "未声明说明")}</p>`
+        + (row.expect !== undefined ? `<p>预期值：<code>${escapeHtml(JSON.stringify(row.expect))}</code></p>` : "")
+        + (rows.length ? `<details><summary>证据 · ${escapeHtml(evidence.source || "recorded")}</summary><pre>${escapeHtml(JSON.stringify(rows, null, 2))}</pre></details>`
+          : '<span class="muted">尚无有效证据</span>') + '</li>';
+    }).join("") + '</ul></section>';
+}
+
+function renderRepairLineage(branches) {
+  if (!branches || !branches.length) return "";
+  const labels = { STARTED: "STARTED · 隔离候选，尚未成为主干", REJECTED: "REJECTED · 已拒绝，保留原主干",
+    PROMOTED: "PROMOTED · 已晋升主干" };
+  return '<details class="evidence-disclosure repair-lineage" data-disclosure="repair-lineage"><summary>修复分支 · '
+    + branches.length + '</summary>' + branches.slice().reverse().map((branch) => {
+      const state = ["STARTED", "REJECTED", "PROMOTED"].includes(branch.status) ? branch.status : "STARTED";
+      return `<div class="repair-branch repair-${state}"><strong>${escapeHtml(labels[state])}</strong>`
+        + `<p>${escapeHtml(branch.branch_id)} · ${escapeHtml(branch.node_id || "")}</p>`
+        + `<p>${branch.phase === "step" ? `单步隔离修复 · 第 ${Number(branch.attempt)} 次尝试` : "整轮目标修复"}</p>`
+        + `<p>基线 ${hashCell(branch.base_commit)} → 候选 ${hashCell(branch.commit)}</p>`
+        + (branch.reasons && branch.reasons.length ? `<p>${escapeHtml(Array.isArray(branch.reasons) ? branch.reasons.join("；") : branch.reasons)}</p>` : "")
+        + (branch.validation ? `<details><summary>分支校验证据</summary><pre>${escapeHtml(JSON.stringify(branch.validation, null, 2))}</pre></details>` : "")
+        + '</div>';
+    }).join("") + '</details>';
+}
+
+function renderTrunkSummary(trunk) {
+  if (!trunk || !trunk.enabled) return "";
+  return '<section class="trunk-summary" aria-label="当前主干"><h3>当前主干</h3>'
+    + `<p>${hashCell(trunk.commit)}</p><p class="expectation-disclaimer">${escapeHtml(trunk.coverage_disclaimer)}</p>`
+    + renderRepairLineage(trunk.branches)
+    + (trunk.snapshots && trunk.snapshots.length
+      ? `<details class="evidence-disclosure" data-disclosure="trunk-snapshots"><summary>不可变主干快照 · ${trunk.snapshots.length}</summary>`
+        + trunk.snapshots.slice().reverse().map((snapshot) => `<p>提交 ${hashCell(snapshot.commit)}<br>摘要 ${hashCell(snapshot.digest)}</p>`).join("") + '</details>' : "")
+    + '</section>';
+}
+
 function stepNode(model, x, y) {
   const { step } = model;
   const skin = stepSkin(step.state);
@@ -1223,7 +1290,8 @@ function stepNode(model, x, y) {
   group.setAttribute("transform", `translate(${x},${y})`);
   group.setAttribute("tabindex", "0"); group.setAttribute("role", "button");
   group.setAttribute("data-step", step.step_id);
-  group.setAttribute("aria-label", (model.plan.objective || step.node_id) + " · " + stateText(step.state));
+  group.setAttribute("aria-label", (model.plan.objective || step.node_id) + " · " + stateText(step.state)
+    + (model.plan.expectation_status ? " · 预期 " + expectationState(model.plan.expectation_status) : ""));
   group.setAttribute("aria-pressed", String(WORKSPACE.selectedId === step.step_id));
   const add = (tag, attrs, text) => {
     const element = document.createElementNS(ns, tag);
@@ -1236,9 +1304,11 @@ function stepNode(model, x, y) {
   add("circle", { cx: STEP.w - 17, cy: 20, r: 3, fill: skin.dot });
   add("text", { x: 16, y: 46, class: "lane-title" }, nodeLabel(model.plan.objective || step.node_id));
   add("text", { x: 16, y: 66, class: "lane-state" }, stateText(step.state));
-  add("text", { x: 16, y: 85, class: "lane-meta" },
-    `尝试 ${step.attempt}/${step.max_attempts}` + (model.attempts.length > 1
-      ? ` · 重试 ${model.attempts.length - 1}` : ""));
+  add("text", { x: 16, y: 85, class: model.plan.expectation_status
+    ? "lane-expectation expectation-" + expectationState(model.plan.expectation_status) : "lane-meta" },
+    model.plan.expectation_status ? `预期 ${expectationState(model.plan.expectation_status)} · ${Math.round((model.plan.expectation_score || 0) * 100)}% 证据覆盖`
+      : `尝试 ${step.attempt}/${step.max_attempts}` + (model.attempts.length > 1
+        ? ` · 重试 ${model.attempts.length - 1}` : ""));
   const phase = phaseIndex(model);
   for (let i = 0; i < 4; i += 1) {
     add("rect", { x: 16 + i * 51, y: 100, width: 44, height: 3, rx: 1.5,
@@ -1446,7 +1516,7 @@ function renderStepActions(model, runStatus) {
   const host = $("#step-actions");
   if (!host) return;
   const step = model.step;
-  const resumable = runStatus === "AWAITING_APPROVAL" && step.state === "ESCALATED";
+  const resumable = runStatus === "AWAITING_APPROVAL" && step.execution_authorization_required === true;
   if (model.declared === false) { host.innerHTML = '<p class="muted">步骤尚未开始执行。</p>'; return; }
   const from = replayBase(model);
   const reuses = Boolean(step.result_commit);
@@ -1606,6 +1676,8 @@ function renderStepDetail(model, tab = "overview") {
     ["依赖 sha", hashCell(artifact.dependency_digest)], ["日志引用", hashCell(artifact.execution_log_ref)]];
   return `<div class="overview-status"><span class="pill ${escapeHtml(step.state)}">${escapeHtml(stateText(step.state))}</span><span class="eyebrow">STEP ${String(model.index).padStart(2, "0")}</span></div>
     <p class="overview-objective">${escapeHtml(model.plan.intent || model.plan.objective || step.node_id)}</p>
+    ${renderExpectationEvidence(model.plan)}
+    ${renderRepairLineage(model.repairBranches)}
     <div class="step-lifecycle">${["执行", "校验", "审查", "提交"].map((label, index) => `<span title="${phaseEvidenceMissing(model, index) ? "没有本次门禁记录，请查看门禁与溯源" : ""}" class="lifecycle-stage ${phaseEvidenceMissing(model, index) ? "unrecorded" : index < phase ? "done" : index === phase && !["PENDING", "READY", "NOT_DECLARED"].includes(step.state) ? "current" : ""}">${escapeHtml(label)}</span>`).join("")}</div>
     <div class="overview-metrics"><div class="overview-metric"><small>当前尝试 / 上限</small><strong>${escapeHtml(step.attempt)} / ${escapeHtml(step.max_attempts)}</strong></div><div class="overview-metric"><small>最近执行耗时</small><strong>${escapeHtml(stepDuration(model))}</strong></div></div>
     ${step.last_failure ? `<p class="summary-note warning">${escapeHtml(step.last_failure)}</p>` : ""}
@@ -1673,7 +1745,8 @@ function renderTaskOverview() {
       + '</p><h3>执行计划</h3><dl class="inspector-facts">'
       + kvHtml([["步骤", escapeHtml(String((plan.nodes || []).length))], ["依赖", escapeHtml(String((plan.edges || []).length))],
         ["风险级别", escapeHtml(plan.risk_level)], ["审批", escapeHtml(specs && specs.approval ? specs.approval.statement || "查看规格与计划" : "查看规格与计划")]])
-      + '</dl>' + ((specs && specs.specs) || []).map((card) => `<details class="evidence-disclosure"><summary>${escapeHtml(card.title || card.spec_type || "规格")}</summary><dl class="inspector-facts">${kvHtml((card.summary || []).map(([key, value]) => [key, escapeHtml(value)]))}</dl></details>`).join("")
+      + '</dl>' + renderTrunkSummary(plan.trunk)
+      + ((specs && specs.specs) || []).map((card) => `<details class="evidence-disclosure"><summary>${escapeHtml(card.title || card.spec_type || "规格")}</summary><dl class="inspector-facts">${kvHtml((card.summary || []).map(([key, value]) => [key, escapeHtml(value)]))}</dl></details>`).join("")
       + '<p class="muted inspector-caption">点击任意节点查看目标、依赖、改动、门禁和记录。</p>';
   }
   const actions = $("#step-actions"); if (actions) actions.innerHTML = '<p class="muted">选中步骤后查看可用操作。</p>';
@@ -1701,7 +1774,7 @@ async function loadExecution() {
     const [detail, route, plan, runs, goalAudit, validation] = await Promise.all([
       api(`/api/runs/${encodeURIComponent(runId)}`), api(`/api/runs/${encodeURIComponent(runId)}/route`),
       api(`/api/runs/${encodeURIComponent(runId)}/plan`), api("/api/runs"),
-      api(`/api/runs/${encodeURIComponent(runId)}/goal-audit`).catch(() => ({status: "UNAVAILABLE", manual_reason: "目标审计未连接。后端升级并重启后可查看，当前仍可跟踪步骤执行。"})),
+      api(`/api/runs/${encodeURIComponent(runId)}/goal-audit`).catch(() => ({status: "UNAVAILABLE", stop_reason: "目标审计未连接。后端升级并重启后可查看，当前仍可跟踪步骤执行。"})),
       api(`/api/runs/${encodeURIComponent(runId)}/validations`).catch(() => null),
     ]);
     if (request !== WORKSPACE.request || MODULE_RUN.id !== runId) return;
@@ -2633,13 +2706,23 @@ function renderPlanOverview(plan, detail) {
   }).join("");
   host.innerHTML = `${layout.cyclic || layout.missing.length ? '<p class="alert">计划存在循环或缺失依赖，请检查规格。</p>' : ""}<div class="plan-canvas" style="width:${layout.width}px;height:${layout.height}px"><svg aria-hidden="true" width="${layout.width}" height="${layout.height}"><defs><marker id="plan-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" /></marker></defs>${lines}</svg>${models.map((m) => {
     const point = layout.points.get(m.step.node_id);
-    return `<button class="plan-node" data-plan-node="${escapeHtml(m.step.node_id)}" style="left:${point.x}px;top:${point.y}px;width:${STEP.w}px;height:${STEP.h}px" aria-pressed="false"><span class="muted">STEP ${String(m.index).padStart(2, "0")} · ${escapeHtml(stateText(m.step.state))}</span><strong>${escapeHtml(m.plan.objective || m.step.node_id)}</strong><span class="muted">${(m.plan.deps || []).length ? (m.plan.deps || []).length + " 个前置步骤" : "起始步骤"} →</span></button>`;
+    return `<button class="plan-node" data-plan-node="${escapeHtml(m.step.node_id)}" style="left:${point.x}px;top:${point.y}px;width:${STEP.w}px;height:${STEP.h}px" aria-pressed="false"><span class="muted">STEP ${String(m.index).padStart(2, "0")} · ${escapeHtml(stateText(m.step.state))}</span><strong>${escapeHtml(m.plan.objective || m.step.node_id)}</strong><span class="muted">${expectationBadge(m.plan) || ((m.plan.deps || []).length ? (m.plan.deps || []).length + " 个前置步骤" : "起始步骤")}</span></button>`;
   }).join("")}</div>`;
   const select = (id) => {
     const m = models.find((item) => item.step.node_id === id) || models[0];
     PLANNING.selected = m.step.node_id;
     $$("[data-plan-node]", host).forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.planNode === m.step.node_id)));
-    $("#plan-detail").innerHTML = `<span class="eyebrow">STEP ${m.index} / ${models.length}</span><h3>${escapeHtml(m.plan.objective || m.step.node_id)}</h3><p>${escapeHtml(stateText(m.step.state))}</p><h4>前置依赖</h4><p>${escapeHtml((m.plan.deps || []).join(" · ") || "无，可直接开始")}</p><h4>预期产物</h4>${renderDocument(m.plan.expected_artifacts || [])}<h4>验收标准</h4>${renderDocument((m.plan.extra || {}).acceptance_criteria || m.plan.acceptance_criteria || "沿用目标规格中的验收标准")}<details class="secondary-details"><summary>完整步骤定义</summary>${renderDocument(m.plan)}</details><a class="button" href="/execution/${encodeURIComponent(MODULE_RUN.id)}">进入工作台查看执行 →</a>`;
+    const definition = Object.fromEntries(
+      Object.entries(m.plan).filter(([key]) => !key.startsWith("expectation"))
+    );
+    $("#plan-detail").innerHTML = `<span class="eyebrow">STEP ${m.index} / ${models.length}</span>`
+      + `<h3>${escapeHtml(m.plan.objective || m.step.node_id)}</h3><p>${escapeHtml(stateText(m.step.state))}</p>`
+      + renderExpectationEvidence(m.plan) + renderRepairLineage(m.repairBranches)
+      + `<h4>前置依赖</h4><p>${escapeHtml((m.plan.deps || []).join(" · ") || "无，可直接开始")}</p>`
+      + `<h4>预期产物</h4>${renderDocument(m.plan.expected_artifacts || [])}`
+      + `<h4>验收标准</h4>${renderDocument((m.plan.extra || {}).acceptance_criteria || m.plan.acceptance_criteria || "沿用目标规格中的验收标准")}`
+      + `<details class="secondary-details"><summary>完整步骤定义</summary>${renderDocument(definition)}</details>`
+      + `<a class="button" href="/execution/${encodeURIComponent(MODULE_RUN.id)}">进入工作台查看执行 →</a>`;
   };
   $$("[data-plan-node]", host).forEach((button) => button.addEventListener("click", () => select(button.dataset.planNode)));
   select(PLANNING.selected);
@@ -2683,14 +2766,14 @@ function renderFilteredEvents() {
 function renderGoalAudit(view, compact = false) {
   const stages = view.stages || [];
   if (view.parent_run_id) return `<div class="goal-verdict"><strong>改进 Stage ${Number(view.stage_number)}</strong><a href="/execution/${encodeURIComponent(view.parent_run_id)}">返回主任务查看目标审计 →</a></div>`;
-  const labels = { APPROVE: "目标审计通过", REVISE: "目标偏离 · 待改进", ESCALATE: "需要人工处理", NOT_EVALUATED: "尚无目标审计记录", ITERATING: "正在按反馈改进", AUDITING: "正在审查完整目标", INTERRUPTED: "目标审计中断 · 需要恢复", UNAVAILABLE: "目标审计未连接" };
+  const labels = { APPROVE: "目标审计通过", REVISE: "目标偏离 · 待改进", ESCALATE: "验收未通过 · 已停止", NOT_EVALUATED: "尚无目标审计记录", ITERATING: "正在按反馈改进", AUDITING: "正在审查完整目标", INTERRUPTED: "目标审计中断 · 需要恢复", UNAVAILABLE: "目标审计未连接" };
   const latest = stages[stages.length - 1];
   const acceptanceOnly = latest && latest.scope === "acceptance_only";
   const title = acceptanceOnly && view.status === "APPROVE" ? "原始验收通过 · 未做语义审查" : labels[view.status] || "尚无目标审计记录";
   const summary = `<div class="goal-verdict"><strong>${escapeHtml(title)}</strong><span class="muted">Stage ${Number(view.active_stage) || stages.length} / ${Number(view.max_stages) || 3} · 含首次执行</span></div>`;
   const history = stages.map((stage) => `<details class="goal-stage"><summary><span class="step-number">${Number(stage.stage)}</span><strong>${escapeHtml(labels[stage.decision] || stage.decision)}</strong><code>${escapeHtml(shortDigest(stage.commit))}</code></summary><p>${escapeHtml((stage.reasons || []).join("；"))}</p>${stage.scope === "acceptance_only" ? '<p class="muted">只证明声明的可执行验收，不等同于语义目标完全达成。</p>' : ""}${(stage.required_changes || []).length ? '<h4>下一轮改进要求</h4><ul>' + stage.required_changes.map((item) => `<li>${escapeHtml(item)}</li>`).join("") + '</ul>' : ""}${renderDocument(stage.semantic_criteria || stage.criteria || [])}</details>`).join("");
   const links = (view.iterations || []).filter((stage) => stage.exists !== false).map((stage) => `<a class="button ghost small" href="/execution/${encodeURIComponent(stage.run_id)}">打开 Stage ${Number(stage.stage)} ↗</a>`).join(" ");
-  const body = `${view.manual_reason ? '<p class="alert">' + escapeHtml(view.manual_reason) + '</p>' : ""}${history || '<p class="muted">没有已记录的目标结论。步骤门禁通过或证据评分高，不代表本次目标已经达成。</p>'}<div class="controls">${links}</div>`;
+  const body = `${view.stop_reason ? '<p class="alert">' + escapeHtml(view.stop_reason) + '</p>' : ""}${history || '<p class="muted">没有已记录的目标结论。步骤门禁通过或证据评分高，不代表本次目标已经达成。</p>'}<div class="controls">${links}</div>`;
   return compact ? `<details><summary>${summary}</summary>${body}</details>` : summary + body;
 }
 function updateGoalPanel(selector, view, compact = false) {
@@ -2887,11 +2970,11 @@ function renderWorkflowLoop(goal) {
   }
   const stages = goal.stages || [], latest = stages.slice(-1)[0];
   if (!stages.length && (!goal.enabled || goal.status === "UNAVAILABLE")) {
-    stableHtml(host, `<div class="workflow-loop-head"><div><h3>目标审计尚无记录</h3><p>${escapeHtml(goal.manual_reason || "当前任务尚未记录目标审计，执行完成不代表目标已达成。")}</p></div><a class="button ghost small" href="#flow-execute">回看执行依据</a></div>`);
+    stableHtml(host, `<div class="workflow-loop-head"><div><h3>目标审计尚无记录</h3><p>${escapeHtml(goal.stop_reason || "当前任务尚未记录目标审计，执行完成不代表目标已达成。")}</p></div><a class="button ghost small" href="#flow-execute">回看执行依据</a></div>`);
     return;
   }
   const active = Number(goal.active_stage || 0);
-  const statuses = { APPROVE: "已通过", REVISE: "目标偏离", ESCALATE: "待人工核对" };
+  const statuses = { APPROVE: "已通过", REVISE: "目标偏离", ESCALATE: "验收未决" };
   const title = goal.status === "APPROVE" ? "本轮审计已完成" : goal.status === "ITERATING" ? "按审计反馈进入下一轮执行" : "执行 → 审计 → 改进";
   const stageLinks = [1, 2, 3].map((stage) => {
     const review = stages.find((item) => Number(item.stage) === stage);
@@ -2902,7 +2985,7 @@ function renderWorkflowLoop(goal) {
     const text = review ? statuses[review.decision] || review.decision : progressing ? "进行中" : stage === 1 && !stages.length ? "等待目标审计" : "尚未开始";
     return target ? `<a href="/execution/${encodeURIComponent(target)}" data-state="${escapeHtml(state)}">第 ${Number(stage)} 轮 <b>${escapeHtml(text)}</b></a>` : `<span>第 ${Number(stage)} 轮 · ${escapeHtml(text)}</span>`;
   }).join("");
-  const feedback = latest && latest.decision !== "APPROVE" ? (latest.required_changes || latest.reasons || []).join("；") : goal.manual_reason || "";
+  const feedback = latest && latest.decision !== "APPROVE" ? (latest.required_changes || latest.reasons || []).join("；") : goal.stop_reason || "";
   stableHtml(host, `<div class="workflow-loop-head"><div><h3>${escapeHtml(title)}</h3><p>目标偏离时保留审计反馈，再进入新 stage；含首次最多 3 轮。</p></div><a class="button ghost small" href="#flow-execute">↺ 回看执行</a></div><div class="workflow-stage-list">${stageLinks}</div>${feedback ? '<p class="workflow-feedback">改进依据：' + escapeHtml(feedback) + '</p>' : ""}`);
 }
 

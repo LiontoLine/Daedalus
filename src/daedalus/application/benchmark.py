@@ -414,7 +414,7 @@ def _daedalus(repo, bundle, worker, client, root, max_tokens):
             "run_id": owner.run_id,
             "event_count": len(events),
             "manual_interventions": 0,
-            "requires_manual_review": result.status != "COMPLETED",
+            "requires_manual_review": result.status == "AWAITING_APPROVAL",
             "trace": "daedalus-events.json",
             "event_sequence_errors": len(store.verify_sequences()),
             "inspections": sum(len(json.loads(row["document"]).get("extra", {}).get("inspection_receipts", []))

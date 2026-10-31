@@ -33,10 +33,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from daedalus.application.approvals import ApprovalService
+from daedalus.application.approvals import ApprovalService, execution_authorization_required
 from daedalus.application.artifact_cache import ArtifactCache, ReuseKey, reuse_key_for
 from daedalus.application.execution_log import execution_log_ref
 from daedalus.application.inspection import safe_receipts
+from daedalus.application.source_context import failure_excerpt
 from daedalus.application.fsm_service import StateMachineService
 from daedalus.application.identity import (
     IdentityRequired,
@@ -68,6 +69,7 @@ from daedalus.errors import (
     SpecDigestMismatch,
 )
 from daedalus.infrastructure.git_sandbox import GitSandbox
+from daedalus.infrastructure.redact import redact_text
 from daedalus.infrastructure.sandbox import DriverChoice, DriverRegistry, IsolationUnavailable
 from daedalus.infrastructure.store.event_store import EventStore, idempotency_key
 from daedalus.model.base import TokenBudget
@@ -94,6 +96,8 @@ NON_RETRYABLE_ERRORS = frozenset(
         "illegal_transition",
         "commit_conflict",
         "model_budget_exceeded",
+        "model_call_failed",
+        "model_usage_unknown",
         "worker_no_progress",
         "model_tls_configuration_error",
         "model_tls_verification_failed",
@@ -226,10 +230,11 @@ class RunOrchestrator:
     #: Spec §13.2 artifact reuse. Off by default so an ordinary run never silently skips
     #: work; a replay turns it on deliberately.
     reuse_artifacts: bool = False
-    #: Park the run in AWAITING_APPROVAL when a step escalates (Spec §16). Off, the run
-    #: ends as a partial failure with the step escalated, which is right for a batch job.
+    #: Only an explicit authority decision may park execution; ordinary failures close
+    #: FAILED/PARTIAL_FAILURE. Final delivery review is configured independently.
     park_on_escalation: bool = True
-    #: Risk levels that may never auto-merge on a semantic review alone (Spec §10).
+    #: Noncritical manual review is deferred to full-delivery validation. CRITICAL
+    #: execution authorization remains mandatory before its candidate may commit.
     manual_review_levels: tuple[str, ...] = ("critical",)
     #: Resume mode: continue a run that was parked, applying recorded owner decisions.
     resume: bool = False
@@ -277,6 +282,7 @@ class RunOrchestrator:
 
     def __post_init__(self) -> None:
         self.bundle.validate()
+        self.goal_audit_enabled = self.goal_audit_enabled or self._requires_delivery_review()
         self.fsm = StateMachineService(self.store)
         # Spec §3.2, fail-closed. Every construction site that forgot `identity=` silently
         # disabled owner verification, because the policy read
@@ -565,13 +571,24 @@ class RunOrchestrator:
                 "reuse_artifacts": self.reuse_artifacts,
                 "target_branch": self.target_branch,
                 "goal_audit_enabled": self.goal_audit_enabled,
-                "independent_validation_levels": list(self.independent_validation_levels),
+                "independent_validation_levels": sorted(
+                    set(self.independent_validation_levels)
+                    | (set(self.manual_review_levels) - {"critical"})
+                ),
                 "goal_stage_parent": self.goal_stage_parent,
                 "goal_stage_number": self.goal_stage_number,
                 "isolation": self.isolation.describe() if self.isolation else None,
             },
             correlation_id=self.correlation_id,
         )
+        if self.goal_audit_enabled or self.goal_stage_parent:
+            from daedalus.application.repair_evidence import freeze_contract
+
+            self.store.append(
+                aggregate_id=f"run:{self.run_id}", execution_id=self.execution_id,
+                event_type="TrunkExpectationsFrozen", actor=self.actor,
+                payload=freeze_contract(self.bundle), correlation_id=self.correlation_id,
+            )
         return pool
 
     def scheduler(self) -> Scheduler:
@@ -625,9 +642,9 @@ class RunOrchestrator:
             # Whether we are still parked is decided by whether any escalated step remains
             # *without* an answer, not by the run's status: the status only changes once we
             # decide to unpark, so reading it here would always look parked.
-            if self._has_escalation():
+            if self._approval_step_ids():
                 result.status = RunState.AWAITING_APPROVAL.value
-                result.escalated_steps = tuple(self._escalated_step_ids())
+                result.escalated_steps = tuple(self._approval_step_ids())
                 result.notes.append(
                     "still parked: at least one escalated step has no owner decision yet, or "
                     "its approved content could not be committed"
@@ -713,6 +730,9 @@ class RunOrchestrator:
                     step_id=execution.prepared.step_id, worker_id=self.worker_id
                 ):
                     outcome = self._finish_step(execution, pool=pool, scheduler=scheduler)
+                    from daedalus.application.branch_repair import finish_step_repair
+
+                    finish_step_repair(self, outcome)
                     result.steps.append(outcome)
                     if outcome.committed:
                         result.commits.append(outcome.commit)
@@ -726,24 +746,22 @@ class RunOrchestrator:
                             terminal.add(outcome.step_id)
                     pool.release(outcome.step_id, keep=not outcome.committed)
 
-            # Parking is checked BEFORE the terminal check: an escalated step counts as
-            # terminal for a batch run, so asking "are we finished?" first would end the run
-            # as a partial failure and never give the owner a chance to answer.
-            if self.park_on_escalation and self._has_escalation():
-                # Spec §16: freeze and wait for the Owner. The worktrees are kept, because
-                # the pending change is the subject of the decision.
+            # An ordinary failure is not an approval request. Only a mandatory risk
+            # authorization can interrupt execution; final review follows full acceptance.
+            if self.park_on_escalation and self._approval_step_ids():
                 self.fsm.transition_run(
                     run_id=self.run_id,
                     execution_id=self.execution_id,
                     event_type="RunEscalated",
                     actor=self.actor,
-                    payload={"escalated_steps": self._escalated_step_ids()},
+                    payload={"escalated_steps": self._approval_step_ids(),
+                             "source": "execution_authorization"},
                     correlation_id=self.correlation_id,
                 )
                 pool.park()
                 result.status = RunState.AWAITING_APPROVAL.value
                 result.tokens_used = self.budget.run_used
-                result.escalated_steps = tuple(self._escalated_step_ids())
+                result.escalated_steps = tuple(self._approval_step_ids())
                 result.notes.append(
                     "parked in AWAITING_APPROVAL: "
                     f"{len(result.escalated_steps)} step(s) need an owner decision; "
@@ -765,7 +783,7 @@ class RunOrchestrator:
         result.status = self._final_status()
         result.tokens_used = self.budget.run_used
         if result.status == "COMPLETED" and self.goal_audit_enabled:
-            from daedalus.application.goal_audit import ensure_goal_delivery
+            from daedalus.application.branch_repair import ensure_goal_delivery
             if not ensure_goal_delivery(self, pool, result):
                 pool.park()
                 return result
@@ -845,7 +863,10 @@ class RunOrchestrator:
                 self.run_id, commit
             )
             if self.goal_audit_enabled:
-                goals = self.store.events_for(f"goal:{self.run_id}")
+                goals = [
+                    event for event in self.store.events_for(f"goal:{self.run_id}")
+                    if event.event_type != "GoalTrunkSnapshot"
+                ]
                 if (
                     not goals
                     or goals[-1].event_type != "GoalAuditCompleted"
@@ -910,7 +931,7 @@ class RunOrchestrator:
         # operators would disable the control to get their work done.
         if risk not in {"high", "critical"}:
             return
-        verified_required = self._identity_enforced() or risk in self.independent_validation_levels
+        verified_required = self._identity_enforced() or self._requires_delivery_review()
         if self.store.is_spec_approved(self.spec_digest, verified_only=verified_required):
             return
         if verified_required and self.store.is_spec_approved(self.spec_digest):
@@ -998,8 +1019,11 @@ class RunOrchestrator:
             and str(row["state"]) == StepState.ESCALATED.value
         ]
 
-    def _has_escalation(self) -> bool:
-        return bool(self._escalated_step_ids())
+    def _approval_step_ids(self) -> list[str]:
+        return [
+            step_id for step_id in self._escalated_step_ids()
+            if execution_authorization_required(self.store, step_id)
+        ]
 
     def _apply_resume(
         self,
@@ -1161,6 +1185,15 @@ class RunOrchestrator:
             duration_ms=0,
             approved=True,
         )
+        if outcome.committed:
+            accepted_gate = self._rebase_gate if outcome.rebased else gate
+            self._record_trunk_node(
+                node, sandbox, accepted_gate, committed=True,
+                changed_files=tuple(document["changed_files"]), attempt=int(step["attempt"]),
+            )
+            from daedalus.application.branch_repair import finish_step_repair
+
+            finish_step_repair(self, outcome)
         pool.release(step_id, keep=not outcome.committed)
         return outcome
 
@@ -1482,7 +1515,7 @@ class RunOrchestrator:
             result.notes.append("promotion blocked: no goal approval for the current commit")
             return
         if (
-            self.bundle.goal.risk_level.value in self.independent_validation_levels
+            self._requires_delivery_review()
             and self._independent_approved_commit != pool.integration_head()
         ):
             from daedalus.application.independent_validation import pending_validation
@@ -1518,7 +1551,7 @@ class RunOrchestrator:
                 "waiting for fresh acceptance and a distinct registered validator's attestation"
             )
             return
-        if self.bundle.goal.risk_level.value in self.independent_validation_levels:
+        if self._requires_delivery_review():
             from daedalus.application.independent_validation import IndependentValidationService
 
             IndependentValidationService(self.store, self.identity).recorded_delivery(
@@ -1538,8 +1571,7 @@ class RunOrchestrator:
             "commit": pool.integration_head(),
             "goal_audit_enabled": self.goal_audit_enabled,
             "goal_approved_commit": self._goal_approved_commit,
-            "independent_validation_required": self.bundle.goal.risk_level.value
-            in self.independent_validation_levels,
+            "independent_validation_required": self._requires_delivery_review(),
             "independent_validation_id": self._independent_validation_id,
         }
         self.store.append(
@@ -1587,6 +1619,21 @@ class RunOrchestrator:
             return None
 
         node = self.bundle.plan.node(str(row["node_id"]))
+        attempt = int(row["attempt"]) + 1
+        if self.goal_audit_enabled and attempt > 1:
+            from daedalus.application.branch_repair import repair_branch_count
+            from daedalus.application.goal_audit import MAX_GOAL_STAGES
+
+            if repair_branch_count(self) >= MAX_GOAL_STAGES - 1 or not node.expected_artifacts:
+                self.fsm.transition_step(
+                    step_id=step_id, execution_id=self.execution_id,
+                    event_type="StepExecutionFailed", actor=self.actor, outcome="escalate",
+                    payload={"reason": "shared repair allowance exhausted or output scope missing",
+                             "error_code": "repair_admission_refused", "branch_retryable": False},
+                    correlation_id=self.correlation_id,
+                )
+                scheduler.propagate_failure(node.node_id)
+                return None
         # The control plane owns the budget (SPEC-03 per step, quota per run). A worker that
         # was handed a different TokenBudget would have its spending accounted somewhere the
         # gate never looks, which silently disables the resource boundary.
@@ -1601,7 +1648,7 @@ class RunOrchestrator:
         self._touch_worker(status="BUSY", current_step_id=step_id)
         lease = scheduler.acquire_lease(step_id, worker_id=self.worker_id)
         try:
-            sandbox = pool.acquire(step_id, base_commit=base_commit)
+            sandbox = pool.acquire(step_id, base_commit=base_commit, attempt=attempt)
         except DaedalusError:
             scheduler.release_lease_by_id(lease.lease_id, "RELEASED")
             raise
@@ -1631,25 +1678,41 @@ class RunOrchestrator:
             step_id, state=StepState.RUNNING.value, worktree_path=str(sandbox.worktree_path)
         )
 
+        worker_bundle = self.bundle
+        if self.goal_audit_enabled and attempt > 1:
+            worker_bundle = replace(
+                self.bundle, boundary=replace(
+                    self.bundle.boundary, fs_whitelist=tuple(node.expected_artifacts),
+                ),
+            )
+
         context = WorkerContext(
             step_id=step_id,
             execution_id=self.execution_id,
             node=node,
-            bundle=self.bundle,
+            bundle=worker_bundle,
             base_commit=base_commit,
-            attempt=int(row["attempt"]) + 1,
-            revision_feedback="\n".join(filter(None, [self.stage_feedback, str(row["last_failure"] or "")])),
+            attempt=attempt,
+            revision_feedback="\n".join(filter(None, [
+                self.stage_feedback, self._revision_feedback(step_id) if attempt > 1 else "",
+            ])),
             input_artifacts=self._input_artifacts(node.deps),
+            repair_memory=self._repair_memory(step_id)
+            if attempt > 1 or self.resume or node.extra.get("repair_memory") else (),
         )
-        return _PreparedStep(
+        prepared = _PreparedStep(
             step_id=step_id,
             node=node,
-            attempt=int(row["attempt"]) + 1,
+            attempt=attempt,
             lease_id=lease.lease_id,
             sandbox=sandbox,
             context=context,
             base_commit=base_commit,
         )
+        from daedalus.application.branch_repair import start_step_repair
+
+        start_step_repair(self, prepared)
+        return prepared
 
     def _finish_step(
         self,
@@ -1700,6 +1763,20 @@ class RunOrchestrator:
                 decision="FAIL",
                 non_retryable=worker_result.error in NON_RETRYABLE_ERRORS,
                 sandbox=sandbox,
+                error_code=worker_result.error,
+            )
+
+        if self._repeated_candidate(step_id, sandbox, worker_result, prepared.attempt):
+            return self._fail_step(
+                step_id=step_id, node_id=node.node_id, attempt=prepared.attempt,
+                reason="candidate already rejected without new source or observation evidence",
+                detail="This exact patch was already rejected on this base. Propose a different "
+                       "implementation; no repeated semantic review was dispatched.\n"
+                       + self._revision_feedback(step_id),
+                duration_ms=duration_ms, tokens_used=worker_result.tokens_used,
+                scheduler=scheduler, lease_id=prepared.lease_id, sandbox=sandbox,
+                error_code="repeated_rejected_candidate",
+                candidate_evidence=self._candidate_evidence(worker_result),
             )
 
         self.fsm.transition_step(
@@ -1729,6 +1806,10 @@ class RunOrchestrator:
             elapsed_sec=duration_ms / 1000.0,
         )
         self._record_gate(gate, artifact_digest=artifact_digest)
+        if not gate.allows_commit:
+            self._record_trunk_node(
+                node, sandbox, gate, committed=False, attempt=prepared.attempt,
+            )
 
         # ---- tier1 decision
         self.fsm.transition_step(
@@ -1771,15 +1852,26 @@ class RunOrchestrator:
         )
 
         if tier2_outcome is GateDecision.ESCALATE:
-            # ESCALATED, not SUPERSEDED: the step is not discarded, it is waiting. A parked
-            # run keeps this step and its worktree so the owner has something to decide on.
+            approval_required = bool(
+                gate.tier2 and not gate.tier2.fail_closed
+                and gate.tier2.decision is GateDecision.APPROVE
+                and self.bundle.goal.risk_level.value == "critical"
+            )
+            self._record_failed_candidate(
+                step_id, sandbox, "mandatory execution authorization" if approval_required
+                else "semantic acceptance is inconclusive",
+                "\n".join(gate.reasons), True, error_code="approval_required"
+                if approval_required else "review_inconclusive",
+            )
             self.fsm.transition_step(
                 step_id=step_id,
                 event_type="StepExecutionFailed",
                 actor=self.actor,
                 execution_id=self.execution_id,
                 outcome="escalate",
-                payload={"reason": "tier-2 escalated to a human owner"},
+                payload={"reason": "mandatory execution authorization" if approval_required
+                         else "semantic acceptance is inconclusive",
+                         "approval_required": approval_required, "branch_retryable": False},
                 correlation_id=self.correlation_id,
             )
             scheduler.release_lease_by_id(prepared.lease_id, "RELEASED")
@@ -1802,7 +1894,11 @@ class RunOrchestrator:
                 node_id=node.node_id,
                 attempt=prepared.attempt,
                 reason="Tier-2 semantic review requested changes",
-                detail="\n".join(gate.tier2.violations) if gate.tier2 else "",
+                detail=(
+                    "Required changes:\n" + "\n".join(gate.tier2.violations)
+                    + "\nCode-inspection evidence (not executed tests):\n"
+                    + "\n".join(gate.tier2.reasons)
+                ) if gate.tier2 else "",
                 duration_ms=duration_ms,
                 tokens_used=self.budget.step_used,
                 scheduler=scheduler,
@@ -1810,10 +1906,12 @@ class RunOrchestrator:
                 decision=GateDecision.REVISE.value,
                 already_decided=True,
                 sandbox=sandbox,
+                error_code="semantic_revision",
+                candidate_evidence=self._candidate_evidence(worker_result),
             )
 
         # ---- commit and integrate
-        return self._commit_step(
+        outcome = self._commit_step(
             step_id=step_id,
             node=node,
             sandbox=sandbox,
@@ -1826,6 +1924,15 @@ class RunOrchestrator:
             attempt=prepared.attempt,
             duration_ms=duration_ms,
         )
+        if outcome.committed:
+            accepted_gate = self._rebase_gate if outcome.rebased else gate
+            if accepted_gate is None:
+                raise DaedalusError("committed candidate has no current acceptance evidence")
+            self._record_trunk_node(
+                node, sandbox, accepted_gate, committed=True,
+                changed_files=artifact.changed_files, attempt=prepared.attempt,
+            )
+        return outcome
 
     def _emit_tier2_decision(
         self,
@@ -1840,14 +1947,15 @@ class RunOrchestrator:
                 event_type="StepTier2Decided",
                 actor=self.actor,
                 execution_id=self.execution_id,
-                outcome="approve",
+                outcome="approve" if gate.allows_commit else "escalate",
                 payload={
-                    "summary": "no semantic reviewer configured; Tier-1 pass is sufficient",
+                    "summary": "no semantic reviewer configured",
+                    "reason": "" if gate.allows_commit else "required semantic reviewer unavailable",
                     "artifact_digest": artifact_digest,
                 },
                 correlation_id=self.correlation_id,
             )
-            return GateDecision.APPROVE
+            return GateDecision.APPROVE if gate.allows_commit else GateDecision.ESCALATE
 
         outcome_map = {
             GateDecision.APPROVE: "approve",
@@ -1869,6 +1977,8 @@ class RunOrchestrator:
                 "summary": " ".join(gate.tier2.reasons)
                 or f"reviewer said {gate.tier2.decision.value}",
                 "violations": list(gate.tier2.violations),
+                "reason": "\n".join(gate.tier2.violations or gate.tier2.reasons)
+                if effective is not GateDecision.APPROVE else "",
                 "confidence": gate.tier2.confidence,
                 "fail_closed": gate.tier2.fail_closed,
                 # Both are recorded: the reviewer's own verdict and the effective one, so the
@@ -2346,13 +2456,24 @@ class RunOrchestrator:
         already_decided: bool = False,
         non_retryable: bool = False,
         sandbox: GitSandbox | None = None,
+        error_code: str = "",
+        candidate_evidence: str = "",
     ) -> StepOutcome:
-        # Revert the rejected attempt inside the step's own worktree, so it cannot leak
-        # into a later accepted attempt of the same step.
+        # Preserve evidence before reverting, so rejected code cannot leak into a retry.
+        if sandbox is not None:
+            self._record_failed_candidate(
+                step_id, sandbox, reason, detail, non_retryable,
+                error_code=error_code, candidate_evidence=candidate_evidence,
+            )
         if sandbox is not None:
             sandbox.reset_hard()
 
         retryable = (not non_retryable) and attempt < self._max_attempts(step_id)
+        if retryable and self.goal_audit_enabled:
+            from daedalus.application.branch_repair import repair_branch_count
+            from daedalus.application.goal_audit import MAX_GOAL_STAGES
+
+            retryable = repair_branch_count(self) < MAX_GOAL_STAGES - 1
         if retryable:
             # Spec §17: exponential backoff, capped. Sleeping here rather than in the scheduler
             # keeps the delay attributable to the step that failed.
@@ -2371,6 +2492,8 @@ class RunOrchestrator:
                     "reason": reason,
                     "detail": detail[:4000],
                     "recoverable": retryable,
+                    "branch_retryable": not non_retryable,
+                    "error_code": error_code,
                 },
                 correlation_id=self.correlation_id,
             )
@@ -2517,6 +2640,180 @@ class RunOrchestrator:
         )
 
     # ---------------------------------------------------------------- gatekeeper
+    def _record_trunk_node(self, node, sandbox, gate, *, committed, changed_files=(), attempt=0):
+        if not (self.goal_audit_enabled or self.goal_stage_parent):
+            return
+        from daedalus.application.repair_evidence import affected_nodes
+
+        criteria = [row for check in gate.tier1.checks
+                    for row in check.evidence.get("criteria", [])]
+        self.store.append(
+            aggregate_id=f"run:{self.run_id}", execution_id=self.execution_id,
+            event_type="TrunkNodeValidated" if committed else "TrunkNodeFailed",
+            actor=self.actor,
+            payload={
+                "node_id": node.node_id, "commit": sandbox.head(), "criteria": criteria,
+                "attempt": attempt,
+                "invalidated_nodes": [
+                    node_id for node_id in affected_nodes(
+                        self.bundle, node.node_id, changed_files
+                    ) if node_id != node.node_id
+                ] if committed else [],
+                "gate_result_id": gate.tier1_result_id,
+                "reason": "; ".join(gate.reasons), "retryable": gate.decision is GateDecision.REVISE,
+            },
+            correlation_id=self.correlation_id,
+        )
+
+    def _record_failed_candidate(self, step_id, sandbox, reason, detail, non_retryable, *,
+                                 error_code="", candidate_evidence=""):
+        row = self.store.get_step(step_id)
+        diff = sandbox.diff()
+        self.store.append(
+            aggregate_id=f"run:{self.run_id}", execution_id=self.execution_id,
+            event_type="TrunkNodeFailed", actor=self.actor,
+            payload={
+                "node_id": str(row["node_id"]), "commit": sandbox.head(), "criteria": [],
+                "candidate_tree": sandbox.tree_digest(),
+                "step_id": step_id, "attempt": int(row["attempt"]),
+                "error_code": error_code, "candidate_evidence": candidate_evidence,
+                "reason": redact_text(reason),
+                "detail": failure_excerpt(redact_text(detail), limit=4000),
+                "retryable": not non_retryable, "patch_digest": digest_of(diff.patch),
+                "patch": redact_text(diff.patch)[:PATCH_PREVIEW_BYTES],
+                "changed_files": list(diff.files),
+            },
+            correlation_id=self.correlation_id,
+        )
+
+    def _repair_memory(self, step_id: str) -> tuple[dict[str, Any], ...]:
+        """Recall scoped attempts, including resumed executions and explicit frozen lineage.
+
+        These observations guide edits, never establish current acceptance or authority.
+        Unrelated runs are not searched or imported implicitly.
+        """
+        step = self.store.get_step(step_id)
+        if step is None:
+            return ()
+        node = self.bundle.plan.node(str(step["node_id"]))
+        seed = node.extra.get("repair_memory", {})
+        records = []
+        if (isinstance(seed, dict) and seed.get("goal_id") == self.bundle.goal.goal_id
+                and seed.get("node_id") == node.node_id
+                and seed.get("paths") == list(node.expected_artifacts)
+                and isinstance(seed.get("entries"), list)):
+            records.extend(item for item in seed["entries"] if isinstance(item, dict))
+        checked = {}
+        for event in self.store.events_for(f"run:{self.run_id}"):
+            if (event.event_type == "TrunkNodeFailed"
+                    and event.payload.get("node_id") == node.node_id
+                    and event.payload.get("gate_result_id")):
+                checked[event.payload.get("attempt")] = {
+                    "failed_criteria": [
+                        row["criterion_id"] for row in event.payload.get("criteria", [])
+                        if row.get("ok") is False and not row.get("error_code")
+                    ],
+                    "passed_criteria": [
+                        row["criterion_id"] for row in event.payload.get("criteria", [])
+                        if row.get("ok") is True and row.get("executed") is not False
+                    ],
+                }
+            if (event.event_type == "TrunkNodeFailed"
+                    and event.payload.get("node_id") == node.node_id
+                    and event.payload.get("patch_digest")):
+                records.append({
+                    **event.payload, "source_event_id": event.event_id,
+                    "source_run_id": self.run_id, "source_execution_id": event.execution_id,
+                    "source_spec_digest": self.spec_digest,
+                    **checked.get(event.payload.get("attempt"), {}),
+                })
+        selected, seen, used = [], set(), 0
+        for item in reversed(records):
+            key = (str(item.get("source_run_id", "")), str(item.get("source_execution_id", "")),
+                   str(item.get("attempt", "")), str(item.get("patch_digest", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            record = {
+                field: str(item.get(field, ""))[:256] for field in (
+                    "source_event_id", "source_run_id", "source_execution_id", "source_spec_digest",
+                    "attempt", "error_code", "commit", "candidate_tree", "patch_digest",
+                )
+            }
+            failed = item.get("failed_criteria", [])
+            record["failed_criteria"] = [str(key)[:128] for key in failed[:12]] \
+                if isinstance(failed, list) else []
+            passed = item.get("passed_criteria", [])
+            record["historical_passed_criteria"] = (
+                [str(key)[:128] for key in passed[:12]] if isinstance(passed, list) else []
+            )
+            record["evidence_kind"] = (
+                "executed_check_failure" if record["failed_criteria"]
+                else "review_hypothesis" if record["error_code"] in {
+                    "semantic_revision", "repeated_rejected_candidate", "historical_stop"}
+                else "edit_or_control_failure"
+            )
+            record["observation"] = failure_excerpt(redact_text(
+                str(item.get("reason", "")) + "\n" + str(item.get("detail", ""))
+            ), limit=700)
+            size = len(json.dumps(record, ensure_ascii=False))
+            if len(selected) < 8 and used + size <= 6000:
+                selected.append(record)
+                used += size
+        selected.reverse()
+        omitted = len(seen) - len(selected)
+        if omitted:
+            selected.insert(0, {"older_records_omitted": omitted,
+                                "note": "History is bounded; omitted observations are not resolved."})
+        return tuple(selected)
+
+    def _revision_feedback(self, step_id: str) -> str:
+        row = self.store.get_step(step_id)
+        if row is None:
+            return ""
+        for event in reversed(self.store.events_for(f"run:{self.run_id}")):
+            if (event.execution_id == self.execution_id and event.event_type == "TrunkNodeFailed"
+                    and event.payload.get("node_id") == row["node_id"]
+                    and event.payload.get("patch_digest")):
+                evidence = event.payload
+                feedback = (
+                    str(evidence.get("reason", "")) + "\n"
+                    + str(evidence.get("detail", ""))
+                    + "\nRepair the current accepted base, not the rejected source. "
+                    + "Verify the actual changed behavior; comments and summaries are not fixes."
+                )
+                if evidence.get("patch"):
+                    feedback += "\nRejected patch (not current source):\n" + evidence["patch"][:1200]
+                return feedback[:5500]
+        return str(row["last_failure"] or "")
+
+    def _candidate_evidence(self, result: WorkerResult) -> str:
+        return digest_of([
+            receipt["evidence_digest"]
+            for receipt in safe_receipts(result.extra.get("inspection_receipts", []))
+            if receipt.get("evidence_digest")
+        ])
+
+    def _repeated_candidate(self, step_id, sandbox, worker_result, attempt) -> bool:
+        if attempt <= 1:
+            return False
+        patch = sandbox.diff().patch
+        if not patch:
+            return False
+        row = self.store.get_step(step_id)
+        patch_digest = digest_of(patch)
+        evidence_digest = self._candidate_evidence(worker_result)
+        return any(
+            event.execution_id == self.execution_id
+            and event.event_type == "TrunkNodeFailed"
+            and event.payload.get("node_id") == row["node_id"]
+            and event.payload.get("error_code") in {"semantic_revision", "repeated_rejected_candidate"}
+            and event.payload.get("commit") == sandbox.base_commit
+            and event.payload.get("patch_digest") == patch_digest
+            and event.payload.get("candidate_evidence") == evidence_digest
+            for event in self.store.events_for(f"run:{self.run_id}")
+        )
+
     def _gate(
         self,
         *,
@@ -2531,11 +2828,12 @@ class RunOrchestrator:
         return gatekeeper.gate(
             artifact=artifact,
             sandbox=sandbox,
-            goal_intent=self.bundle.goal.objective,
+            goal_intent=self.bundle.goal.objective
+            + "\nInvariants: " + json.dumps(self.bundle.goal.invariants),
             node_intent=node.intent or node.objective,
             acceptance_criteria=tuple(
                 f"{c.criterion_id}: {c.statement or c.command or c.path}"
-                for c in self.bundle.goal.acceptance_criteria
+                for c in gatekeeper.tier1._criteria()[0]
             ),
             subject_digest=self.spec_digest,
             execution_log=execution_log,
@@ -2546,10 +2844,39 @@ class RunOrchestrator:
     def _get_gatekeeper(self, node: Any) -> Gatekeeper:
         if self.tier2 is not None and hasattr(self.tier2.reviewer, "budget"):
             self.tier2.reviewer.budget = self.budget
+        boundary = self.bundle.boundary
+        if node.extra.get("repair_allowed_paths"):
+            boundary = replace(boundary, fs_whitelist=tuple(node.extra["repair_allowed_paths"]))
+        row = self.store.get_step(f"{self.run_id}:{node.node_id}")
+        if self.goal_audit_enabled and row and int(row["attempt"]) > 1:
+            boundary = replace(boundary, fs_whitelist=tuple(node.expected_artifacts))
+            from daedalus.application.branch_repair import _node_evidence
+            from daedalus.application.repair_evidence import build_snapshot
+
+            snapshot = build_snapshot(
+                self.bundle, self.pool.integration_head(),
+                node_evidence=_node_evidence(self),
+            )
+            checks = {c.criterion_id: c for c in (
+                node.acceptance_criteria or self.bundle.goal.acceptance_criteria
+            )}
+            definitions = {
+                c.criterion_id: c
+                for original in self.bundle.plan.nodes
+                for c in (original.acceptance_criteria or self.bundle.goal.acceptance_criteria)
+            }
+            for record in snapshot["nodes"]:
+                for expectation in record["expectations"]:
+                    if expectation["status"] == "MET":
+                        key = expectation["criterion_id"]
+                        checks.setdefault(key, definitions[key])
+            node = replace(node, extra={
+                **node.extra, "acceptance_criteria": [c.to_dict() for c in checks.values()]
+            })
         tier1 = Tier1Gate(
             goal=self.bundle.goal,
             plan_node=node,
-            boundary=self.bundle.boundary,
+            boundary=boundary,
             meta=self.bundle.meta,
             driver=self.isolation.driver if self.isolation else None,
             dependency_cache=self.store.path.parent / "dependency-cache",
@@ -2558,7 +2885,13 @@ class RunOrchestrator:
             tier1=tier1,
             tier2=self.tier2,
             risk_level=self.bundle.goal.risk_level.value,
-            manual_review_levels=frozenset(self.manual_review_levels),
+            manual_review_levels=frozenset({"critical"}),
+        )
+
+    def _requires_delivery_review(self) -> bool:
+        risk = self.bundle.goal.risk_level.value
+        return risk in self.independent_validation_levels or (
+            risk != "critical" and risk in self.manual_review_levels
         )
 
     def _record_gate(self, gate: GateOutcome, *, artifact_digest: str) -> None:
