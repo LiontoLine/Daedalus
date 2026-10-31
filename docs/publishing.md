@@ -99,6 +99,29 @@ Actions 显示失败时，打开失败 Job 内的红色步骤，保留失败命�
 
 GitHub 下载的源码 ZIP 不包含 `.git/` 和 Actions 日志。修复这种副本后，应将改动提交到原仓库：使用已有 clone，或在 GitHub 网页按原路径替换文件。不要在下载副本里另建无关历史后强制推送。
 
+### 提交新增模块，验证真正进入 Git 的内容
+
+复制修改包后，先检查 `git status --short --untracked-files=all` 中的 `??`。`git commit -am` 只处理已经跟踪的文件，不会提交新增模块、测试或 Markdown；本机导入成功也可能只是读到了未跟踪文件。
+
+按审核后的发布范围暂存，检查新增项和差异，再提交；不要将本机运行资料加入暂存区：
+
+```bash
+git add -- README.md CHANGELOG.md PROJECT_INDEX.md AGENTS.md src tests scripts docs
+git diff --cached --name-status
+git diff --cached --stat
+```
+
+提交前可从暂存区导出干净副本，避免验证意外读取工作目录中的未跟踪文件：
+
+```bash
+verify_dir=$(mktemp -d)
+git checkout-index --all --prefix="$verify_dir/"
+python -m build --wheel --outdir "$verify_dir/dist" "$verify_dir"
+```
+
+导出的文件不含 `.git`。还需将生成的 wheel 安装到独立虚拟环境，执行上面的安装后控制台检查；不能让 `PYTHONPATH` 或另一个 editable 安装替缺失的包内容兜底。上述步骤只准备和检查提交，不推送远端。
+
+
 动作运行时依据：[checkout v5](https://github.com/actions/checkout/blob/v5/action.yml)、[setup-python v6](https://github.com/actions/setup-python/blob/v6/action.yml)、[upload-artifact v7](https://github.com/actions/upload-artifact/blob/v7/action.yml)。
 
 

@@ -184,9 +184,9 @@ def responder(payload: dict) -> Reply:
             prompt, subject_digest=subject_digest,
         ))
         if "FINAL GOAL audit" in prompt:
-            summary = json.loads(
-                prompt.split("## Deterministic gate summary\n", 1)[1]
-                .split("\n\n## Changed files", 1)[0]
+            # Other prompt sections follow the summary; decode only its leading JSON object.
+            summary, _ = json.JSONDecoder().raw_decode(
+                prompt.split("## Deterministic gate summary\n", 1)[1].lstrip()
             )
             review["criterion_results"] = [
                 {
