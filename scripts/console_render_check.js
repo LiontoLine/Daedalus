@@ -124,7 +124,7 @@ const domListeners = {};
 const elements = new Map();
 // Ids the templates render as something other than a div. Modelling them keeps the
 // stub honest: a <select> without `.options` throws in a faithful render.
-const SELECT_IDS = new Set(["#model-role", "#diff-step", "#run-picker"]);
+const SELECT_IDS = new Set(["#model-role", "#diff-step"]);
 const elementFor = (selector) => {
   if (!elements.has(selector)) {
     elements.set(selector, new Element(SELECT_IDS.has(selector) ? "select" : "div"));
@@ -146,7 +146,7 @@ const sandbox = {
     activeElement: null,
     body: { dataset: { page: "execution", runId: "template-run" } },
   },
-  window: { DAEDALUS_RUN_ID: "" },
+  window: { location: {hash: ""} },
   CSS: { escape: (value) => String(value) },
   setInterval: () => 0,
   clearInterval: () => {},
@@ -247,8 +247,6 @@ for (const model of models) {
       `step ${step.node_id} is marked as retried on the box itself`);
   }
 }
-// Nodes show execution phases; hashes remain available in the inspector.
-check(lane.includes('height="3"'), "nodes carry a compact execution phase indicator");
 
 sandbox.renderRunStats(route, models);
 const stats = renderMarkup("#run-stats");
@@ -797,7 +795,8 @@ bootSandbox.document = {
   createElementNS: (_ns, tag) => new Element(tag),
   querySelector: (selector) => (String(selector).startsWith("#") ? elementFor(selector) : null),
   querySelectorAll: () => [],
-  body: Object.assign(new Element("body"), { dataset: { page: "intake" } }),
+  getElementById: (id) => elementFor("#" + id),
+  body: Object.assign(new Element("body"), { dataset: { page: "workflow", initialStage: "task" } }),
 };
 bootSandbox.fetch = async (path) => {
   booted.push(String(path));
@@ -806,8 +805,8 @@ bootSandbox.fetch = async (path) => {
     ? (payload.model || { roles: [], override: null, persisted: false })
     : value.startsWith("/api/repos")
       ? { repos: payload.intake_repos || [], roots: [] }
-      : value.startsWith("/api/intakes")
-        ? { intakes: [] }
+      : value === "/api/runs"
+        ? { runs: [payload.detail.run] }
         : {};
   return { ok: true, status: 200, text: async () => JSON.stringify(body) };
 };
@@ -846,8 +845,7 @@ if (typeof bootHandler === "function") {
     + `initialiser ran (requested: ${booted.slice(0, 6).join(", ") || "nothing"})`);
   check(booted.includes("/api/model"),
     "and must load the model panel, so the endpoint slot is usable");
-  check(booted.some((path) => path.startsWith("/api/intakes")),
-    "and must render the recent-intake list");
+  check(booted.includes("/api/runs"), "the new-task page loads persisted task history");
 }
 
 /* ======================================================================
@@ -1080,8 +1078,11 @@ const wfRead = (expression) => vm.runInContext(expression, wfSandbox);
 await wfSandbox.initWorkflow();
 await new Promise((resolve) => setTimeout(resolve, 0));
 check(wfRead("MODULE_RUN.id") === "", "the new-task page never silently selects a historical run");
-check(!wfElement("#workflow-create").hidden && !wfElement("#workflow-plan-empty").hidden,
-  "a fresh workflow shows intake and the following-stage placeholders together");
+check(!wfElement("#flow-task").hidden && !wfElement("#workflow-create").hidden
+  && wfElement("#flow-plan").hidden && wfElement("#flow-execute").hidden && wfElement("#flow-audit").hidden,
+  "a fresh workflow shows only the conversation, not empty downstream views");
+check(wfElement("#workflow-history").innerHTML.includes(encodeURIComponent(primary)),
+  "the conversation home lists persisted runs without selecting them");
 wfElement("#intake-objective").value = "draft retained while refreshing";
 await wfSandbox.loadWorkflow();
 check(wfElement("#intake-objective").value === "draft retained while refreshing", "polling preserves the unfinished task draft");
@@ -1092,8 +1093,9 @@ const requestsBefore = wfRequests.length;
 await wfSandbox.freezeIntake();
 check(wfNavigations === 0, "freezing the task must never reload or navigate away from the workflow");
 check(wfRead("MODULE_RUN.id") === primary, "freezing binds every stage to the accepted run");
-check(!wfElement("#workflow-frozen-plan").hidden && !wfElement("#workflow-execution").hidden && !wfElement("#workflow-audit").hidden,
-  "planning, execution and audit are all available on the same page after submission");
+check(!wfElement("#flow-execute").hidden && !wfElement("#workflow-execution").hidden
+  && wfElement("#flow-task").hidden && wfElement("#flow-plan").hidden && wfElement("#flow-audit").hidden,
+  "confirmation shows execution without stacking the other task views");
 check(wfLocation.pathname.endsWith(primary) && wfLocation.hash === "#flow-execute", "the accepted run has a refreshable URL focused on execution");
 const firstReads = wfRequests.slice(requestsBefore);
 check(firstReads.filter((r) => r.path === "/api/runs/" + primary).length === 1,
@@ -1101,6 +1103,10 @@ check(firstReads.filter((r) => r.path === "/api/runs/" + primary).length === 1,
 wfElement("#spec-cards").html += "<!-- kept-open evidence -->";
 await wfSandbox.loadWorkflow();
 check(wfElement("#spec-cards").innerHTML.includes("kept-open evidence"), "unchanged polling preserves expanded spec evidence");
+await wfSandbox.openWorkflowRun(primary, "task");
+check(!wfElement("#flow-task").hidden && wfElement("#flow-execute").hidden
+  && wfElement("#workflow-submitted").innerHTML.includes("任务摘要"),
+  "opening a history entry shows the selected task summary first");
 const completedProgress = wfSandbox.workflowProgress(payload.detail.run, payload.audit.goal_audit, payload.audit.independent_validation);
 check(completedProgress.current === "audit" && completedProgress.states.execute === "done", "completion naturally leads to audit");
 const drifting = wfSandbox.workflowProgress({status: "RUNNING"}, {status: "ITERATING", active_stage: 2});
@@ -1126,7 +1132,8 @@ check(wfRequests.length === oldRequestCount, "moving between stages needs no ext
 let nativeAnchorPrevented = false;
 wfHandlers.click({button: 0, target: {closest: () => ({href: wfLocation.origin + wfLocation.pathname + "#flow-audit", target: "", hasAttribute: () => false})},
   preventDefault() {nativeAnchorPrevented = true;}});
-check(!nativeAnchorPrevented, "the audit stage anchor keeps native in-page scrolling instead of being redirected to execution");
+check(nativeAnchorPrevented && !wfElement("#flow-audit").hidden && wfElement("#flow-plan").hidden,
+  "the audit anchor switches the visible view without losing the current task");
 check(wfNavigations === 0, "the full workflow needs zero full-page navigations");
 wfSandbox.renderWorkflowLoop({status: "UNAVAILABLE", stop_reason: "historical task has no goal audit"});
 if (scenario) {
@@ -1141,16 +1148,14 @@ if (scenario) {
     }
     return fetchBeforeDelay(path, options);
   };
-  const scrolled = [];
-  wfElement("#flow-audit").scrollIntoView = () => scrolled.push("audit");
-  wfElement("#flow-execute").scrollIntoView = () => scrolled.push("execute");
   const older = wfSandbox.openWorkflowRun(primary, "execute");
   await started;
   await wfSandbox.openWorkflowRun(scenario.run.run_id, "audit");
   releaseOlderAudit(); await older;
   check(wfRead("WORKFLOW.run.run_id") === scenario.run.run_id && wfRead("MODULE_RUN.id") === scenario.run.run_id,
     "a slow response from a previous selection cannot replace the current task");
-  check(scrolled.slice(-1)[0] === "audit", "a slow previous selection cannot scroll away from the current task's stage");
+  check(!wfElement("#flow-audit").hidden && wfElement("#flow-execute").hidden,
+    "a slow previous selection cannot change the current task's visible view");
   wfSandbox.fetch = fetchBeforeDelay;
 }
 

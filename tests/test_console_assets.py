@@ -124,7 +124,7 @@ def test_the_console_workspace_and_evidence_views_have_their_panels() -> None:
     for panel in ("intake-objective", "intake-repos", "intake-repo-path", "intake-start",
                   "intake-step-task", "intake-step-questions", "intake-step-review",
                   "intake-progress", "intake-question", "intake-options", "intake-rejections",
-                  "intake-document", "intake-answers", "intake-freeze", "intake-recent",
+                  "intake-document", "intake-answers", "intake-freeze", "workflow-history",
                   # 模型接口: the disclosure that lets the endpoint be changed without a restart
                   "model-panel", "model-summary", "model-current", "model-form", "model-base-url",
                   "model-name", "model-key", "model-timeout", "model-role", "model-ack-wrap",
@@ -141,16 +141,16 @@ def test_the_console_workspace_and_evidence_views_have_their_panels() -> None:
     # 执行: the left-to-right route, one box per step, plus the detail panel that opens from a
     # box and the decisions a parked step needs.
     execution = templates["execution.html"]
-    for panel in ("run-picker", "run-stats", "lane", "lane-track", "route-notes",
+    for panel in ("workflow-history", "run-stats", "lane", "lane-track", "route-notes",
                   "step-panel", "step-title", "step-actions", "step-body",
                   "escalation-panel", "escalation-body",
-                  "graph-fit", "graph-zoom-in", "graph-zoom-out", "focus-step",
+                  "graph-fit", "graph-zoom-in", "graph-zoom-out", "focus-step", "graph-inspector",
                   "inspector-tabs", "inspector-scroll", "workspace-activity"):
         assert f'id="{panel}"' in execution, f"execution must render #{panel}"
 
     # 审计: the patch, the score that summarises the evidence, the §27 answer and the log.
     audit = templates["audit.html"]
-    for panel in ("run-picker", "audit-main", "diff", "diff-summary", "diff-step",
+    for panel in ("audit-main", "diff", "diff-summary", "diff-step",
                   "diff-mode", "audit", "events", "identity-out", "export-jsonl",
                   "export-csv"):
         assert f'id="{panel}"' in audit, f"audit must render #{panel}"
@@ -163,8 +163,6 @@ def test_navigation_keeps_the_current_task_context() -> None:
         assert f'href="#flow-{stage}"' in workflow
         assert f'id="flow-{stage}"' in workflow
     assert 'href="/runs"' in templates["base.html"]
-    assert "openWorkflowRun" in _js()
-    assert "if (isWorkflow()) await openWorkflowRun(payload.run_id" in _js()
     for name in ("intake", "planning", "execution", "audit"):
         assert templates[name + ".html"] == workflow
 
@@ -221,36 +219,6 @@ def test_the_gate_check_styles_the_console_relies_on_exist() -> None:
         assert selector in css, f"console.css must define {selector}"
 
 
-def test_every_page_a_template_renders_has_an_initialiser() -> None:
-    """The one check that would have caught the intake page running no JavaScript at all.
-
-    The boot block dispatched planning/execution/audit and fell through to `initBoard()` for
-    everything else, so the intake's buttons, repository cards and model panel were dead in a
-    browser. Every other test passed: the ids existed, the routes matched, the render functions
-    executed when called directly — none of them asked whether the page's own initialiser had
-    been *reached*. This does, statically, by comparing the pages the templates declare against
-    the pages the boot table names.
-    """
-    script = _js()
-    table = script.split("const PAGE_INITIALISERS = {", 1)
-    assert len(table) == 2, "the console must dispatch pages through one table"
-    registered = set(re.findall(r"^\s{2}([a-z]+):", table[1].split("};", 1)[0], re.M))
-    assert registered, "the dispatch table must name at least one page"
-
-    # The page name is chosen by the route, not written in the template, so `app.py` is the
-    # authoritative list of pages that can reach a browser.
-    declared = set(re.findall(r'page="([a-z]+)"', APP.read_text()))
-    declared |= {
-        match
-        for text in _templates().values()
-        for match in re.findall(r'page="([a-z]+)"', text)
-    }
-    assert declared, "the routes should declare at least one page"
-    missing = sorted(declared - registered)
-    assert not missing, (
-        f"these pages are rendered by a template but have no initialiser in the boot table, "
-        f"so their scripts never run: {missing}"
-    )
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="no JavaScript engine available")

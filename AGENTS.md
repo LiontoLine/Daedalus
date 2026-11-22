@@ -77,6 +77,35 @@ Before handing off a change to the FSM, the gate, the scheduler or the event sto
 the full suite: those modules have adversarial tests that exist specifically to catch a
 relaxed invariant.
 
+### Blind experiments
+
+- For **every experimental batch**, start a **new test-author subagent** before
+  execution. Give it only public behavior, interfaces and resource limits, not
+  implementation source, diffs, solver traces, past answers or credentials. It
+  authors and freezes the workload, independent oracle and measurement code in a
+  separate directory; it does not implement the product or run the experiment.
+- Keep hidden checks outside the implementation and target worktrees. Do not send
+  test source, fixtures with expected answers, or raw hidden failures to the
+  implementation agent or model under test. Pre-existing repository regression
+  commands remain ordinary development checks, not independent experiments.
+- Use a non-agent runner, or a separate restricted runner with only a frozen
+  command and result channel. Do not let an agent running the experiment browse
+  implementation source or hidden check code. Use a packaged candidate in a
+  disposable workspace; hand the implementer only sanitized results. If isolation
+  is unavailable, do not claim a blind result.
+- Record the test-author identity, hashes of the candidate and experiment, the
+  measurement protocol and all outcomes. Never retune a hidden oracle after
+  seeing results; a changed experiment needs a new author and a new record.
+- Before a paid batch, qualify the exact harness against its documented CLI/API
+  and make sure its native commands respect the selected sandbox. Missing fields
+  or setup failures invalidate the measurement; keep the result and fix the
+  harness through a fresh author, never change product isolation to pass it.
+- Operator-provided public requirements can guide the solver. Their private test
+  source, method names, inputs and raw failures cannot. The gate runs the checks
+  and exports only public requirement outcomes and receipt identifiers to models.
+  This still does not make an operator-owned in-process test an opaque oracle for
+  malicious code; keep the sealed benchmark outside that path.
+
 ### Task-result regression is separate from control-plane regression
 
 - A completed experiment is not a resolved task. Keep stopped, rejected and unsafe
@@ -92,3 +121,45 @@ relaxed invariant.
 - Preserve evidence types in memory: executed failures and historical passed checks
   differ from a reviewer's unverified hypothesis. Neither is current approval.
   Persisted logs are not automatically model context; verify what the worker received.
+- Explicit replay may recall one failed parent only when the recorded repository,
+  frozen spec, original replay base and actual node base match. Do not broaden
+  scope, treat old observations as current approval, or fetch unrelated task history.
+- Autonomous original-task regressions are recorded separately under the private
+  ledger's `autonomous_regressions`: an accepted, assisted historical patch is not
+  cold-start model delivery. Preserve configured-profile diagnostic failures as
+  well as profile-matched runs; compare only matching workload/context/profile
+  protocols, and never combine unit-test counts with task results.
+- Qualify the original native interpreter and complete test counters before paid
+  replay. A corrected probe environment is a new development protocol, not a model
+  accuracy gain. Keep its earlier failed runs rather than rewriting their scores.
+- Terminal-repair rechecking and assertion-first consumer navigation have actual
+  native receipts, but mechanism proof is not successful autonomous task delivery.
+  Read the latest phase, stop codes and delivered artifacts before planning changes;
+  do not repeat a paid run without a concrete code or protocol change.
+- A source request or receipt path does not prove source content was delivered.
+  Inspect `status`, nonempty `sources`, and the actual model message. A blocked
+  whole-file scan must not be bypassed through snippets or fixture exceptions.
+- A changed read receipt does not make a rejected same-spec, same-base, same-patch
+  review subject new. Keep observations in events, but use an actual delta in code
+  or qualified executable behavior before spending another paid review or replay.
+- Keep newly autonomous accepted artifacts under same-task native regression after
+  later code changes. Separate retained artifact closure from a new cold-start trial;
+  a later failed solve does not erase a previously verified delivery or its provenance.
+- `autonomous_case_closure` tracks retained, verified task artifacts. Per-phase trial
+  rows and `last_cold_start_failures` track fresh solve outcomes; do not replace one
+  metric with the other when reporting progress or deciding what remains open.
+- A failed-line window is not the whole input contract. Inspect the actual prompt
+  for contrasting invocation inputs and assertions before claiming a source gap
+  is closed; same-setup variants are syntactic hints, not execution or new approval.
+- Keep canonical bounded evidence separate from model-visible projection. Scan
+  complete observations before selecting fields. Preserve useful historical
+  bodies, tree identity, content digests and explicit truncation markers; removing
+  responsibility clues is not a token-efficiency improvement. Context compaction
+  does not authorize a smaller estimate, reset budget or reduced review reserve.
+- Stale-edit refresh must expose the changed expression, not merely any method
+  mentioned by broad task prose. Preserve explicit frozen `Class.method` targets
+  over a model-invented owner; verify both precedence directions with real behavior.
+- Match experimental scoring to frozen check contracts: a plain exit-code script
+  need not emit a native counter receipt. Keep the designated original-issue
+  supervisor's complete receipt requirement; version policy changes and preserve
+  historical reports rather than rescoring failed candidates.

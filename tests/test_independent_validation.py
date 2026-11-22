@@ -32,7 +32,8 @@ REVIEWER_KEY = "test-only-reviewer-secret-for-validation"
 
 
 def make_validation_run(
-    repo, tmp_path, *, natural=False, store=None, identity=None, risk=RiskLevel.HIGH
+    repo, tmp_path, *, natural=False, store=None, identity=None, risk=RiskLevel.HIGH,
+    frozen_behavior=False,
 ):
     bundle = DeterministicPlanner().plan(
         PlanRequest(
@@ -60,6 +61,34 @@ def make_validation_run(
                 ),
             ),
         )
+    if frozen_behavior:
+        from daedalus.application.requirement_evidence import bind_bundle, qualify, seal
+        from daedalus.infrastructure.sandbox import HostProcessDriver
+
+        boundary = replace(bundle.boundary, isolation="host-process")
+        contract = seal({
+            "version": 1, "objective": bundle.goal.objective, "open_questions": [],
+            "requirements": [{"id": "words", "statement": "Count words without changing line count"}],
+            "checks": [
+                {"test_name": "test_private_words", "requirement_id": "words", "role": "change"},
+                {"test_name": "test_private_lines", "requirement_id": "words", "role": "invariant"},
+            ],
+            "source": f"""import runpy
+import unittest
+
+summarize = runpy.run_path({TARGET!r})['summarize']
+
+class RequirementTests(unittest.TestCase):
+    def test_private_words(self):
+        self.assertEqual(summarize('two words')['words'], 2)
+
+    def test_private_lines(self):
+        self.assertEqual(summarize('a\\nb')['lines'], 2)
+""",
+        })
+        proof = qualify(repo, contract, [TARGET], boundary, tmp_path / "baseline",
+                        driver=HostProcessDriver())
+        bundle = bind_bundle(replace(bundle, boundary=boundary), contract, proof)
     store = store or EventStore(tmp_path / "validation.db")
     identity = identity or OwnerRegistry(
         store, environ={"TEST_OWNER": OWNER_KEY, "TEST_REVIEWER": REVIEWER_KEY}
@@ -76,10 +105,10 @@ def make_validation_run(
         worker=ScriptedWorker(
             ops=(FileOp("write", TARGET, CORRECT_IMPLEMENTATION),), worker_id="coder"
         ),
-        tier2=Tier2Gate(reviewer=reviewer),
+        tier2=None if frozen_behavior else Tier2Gate(reviewer=reviewer),
         identity=identity,
         goal_audit_enabled=True,
-        independent_validation_levels=("high", "critical"),
+        independent_validation_levels=("normal",) if frozen_behavior else ("high", "critical"),
         retry_backoff_sec=0,
         run_id="run-validation",
     )
@@ -352,6 +381,7 @@ def test_delivery_recovery_uses_validation_evidence_at_publication_time(
 ):
     owner, service, _ = parked
     from daedalus.application.commit_recovery import reconcile_commits
+    from daedalus.application.delivery_evidence import delivery_view
 
     report = service.evaluate(owner.run_id)
     attest(service, owner, report)
@@ -369,6 +399,9 @@ def test_delivery_recovery_uses_validation_evidence_at_publication_time(
             store=owner.store, run_id=owner.run_id, workspace=str(tmp_path), identity=owner.identity
         )
     assert owner.store.get_run(owner.run_id)["status"] == "RUNNING"
+    pending = delivery_view(owner.store, owner.store.get_run(owner.run_id))
+    assert pending["status"] == "PENDING_CONFIRMATION" and not pending["commit"]
+    assert service.view(owner.run_id)["status"] != "DELIVERED"
     checks = reconcile_commits(owner.store, apply=False)
     assert any(c.repairable and c.kind == "incomplete_delivery" for c in checks)
     # Deliberately append an invalid newer report: recovery must not retroactively use it.
@@ -378,6 +411,10 @@ def test_delivery_recovery_uses_validation_evidence_at_publication_time(
     checks = reconcile_commits(owner.store, apply=True)
     assert any(c.action and c.kind == "incomplete_delivery" for c in checks)
     assert owner.store.get_run(owner.run_id)["status"] == "COMPLETED"
+    publication = delivery_view(owner.store, owner.store.get_run(owner.run_id))
+    assert publication["status"] == "PUBLISHED"
+    assert publication["commit"] == report["commit"] and publication["confirmed_at"]
+    assert service.view(owner.run_id)["status"] == "DELIVERED"
 
 
 def test_commit_change_invalidates_pending_review(parked, monkeypatch):
@@ -403,7 +440,8 @@ def test_http_cli_signing_and_service_resubmission(git_repo, tmp_path, monkeypat
         state = app.state.daedalus
         state.identity.environ = {"TEST_OWNER": OWNER_KEY, "TEST_REVIEWER": REVIEWER_KEY}
         owner, service, _ = make_validation_run(
-            git_repo, settings.workspace.root_path, store=state.store, identity=state.identity
+            git_repo, settings.workspace.root_path, store=state.store, identity=state.identity,
+            risk=RiskLevel.NORMAL, frozen_behavior=True,
         )
         rid = owner.run_id
         # Keep the first completed dispatch in the job registry: a legitimate second
@@ -421,6 +459,16 @@ def test_http_cli_signing_and_service_resubmission(git_repo, tmp_path, monkeypat
         response = client.post(f"/api/runs/{rid}/validations/evaluate")
         assert response.status_code == 200, response.text
         report = response.json()
+        canonical = service.report(rid, report["validation_id"])
+        assert report["checks_passed"] and report["report_digest"] == canonical["report_digest"]
+        assert canonical["goal"]["acceptance_criteria"][-1]["expect"]["behavior_contract"]["source"]
+        for public in (report, client.get(f"/api/runs/{rid}/validations").json(),
+                       client.get(f"/api/runs/{rid}/audit").json()):
+            serialized = json.dumps(public)
+            assert "RequirementTests" not in serialized
+            assert "test_private_words" not in serialized and "test_private_lines" not in serialized
+        behavior = report["criteria"]["evidence"]["criteria"][-1]["behavior_evidence"]
+        assert {row["status"] for row in behavior["requirements"]} == {"MET"}
         review = {
             "decision": "APPROVE",
             "review_notes": "Independently checked diff and fresh tests.",

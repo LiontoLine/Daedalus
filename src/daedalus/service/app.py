@@ -34,7 +34,7 @@ from daedalus.application.approvals import (
     ApprovalError, ApprovalService, NotEscalated, execution_authorization_required,
 )
 from daedalus.application.backup import BackupError, create_backup, list_backups, restore_backup
-from daedalus.application.coding_worker import ModelWorker
+from daedalus.application.worker_factory import build_model_worker
 from daedalus.application.execution_log import execution_log_ref
 from daedalus.application.inspection import safe_receipts
 from daedalus.application.fsm_service import StateMachineService
@@ -69,6 +69,13 @@ from daedalus.model.base import Message, ModelRegistry, TokenBudget
 from daedalus.model.openai_compatible import OpenAICompatibleClient
 from daedalus.security.secrets import CapabilityDenied, SecretBroker
 from daedalus.service.dispatcher import RunDispatcher, ServiceBusy, ServiceError, build_orchestrator
+from daedalus.service.evidence_projection import (
+    public_event_payload,
+    public_goal_audit,
+    public_trunk,
+    public_validation_report,
+    public_validation_view,
+)
 
 logger = get_logger("service")
 
@@ -96,6 +103,7 @@ class RunRequest(BaseModel):
     #: enrolled; without it a high-risk run is refused before it is created.
     spec_signature: str = ""
     requirement_check_id: str = ""
+    require_behavior_paths: bool = False
 
 
 class ApprovalRequest(BaseModel):
@@ -146,6 +154,7 @@ class ReplayRequest(BaseModel):
     #: anything is created, because "replay from <typo>" would otherwise produce a run whose
     #: base does not exist and fail deep inside the worktree pool.
     from_commit: str = ""
+    spec_digest: str = Field(default="", max_length=64)
 
 
 class ModelOverrideRequest(BaseModel):
@@ -208,6 +217,11 @@ class IntakeAnswerRequest(BaseModel):
     skip: bool = False
 
 
+class IntakeDeriveRequest(BaseModel):
+    requirement_check_id: str = Field(default="", max_length=128)
+    require_behavior_paths: bool = False
+
+
 class IntakeFreezeRequest(BaseModel):
     """Freeze the derived spec into a run. §3.2 signatures apply exactly as they do elsewhere."""
 
@@ -216,6 +230,7 @@ class IntakeFreezeRequest(BaseModel):
     use_model: bool = False
     enable_review: bool = False
     spec_digest: str = ""
+    require_behavior_paths: bool = False
 
 
 class RestoreRequest(BaseModel):
@@ -444,23 +459,10 @@ class ServiceState:
             coder_client = coder_client.for_task("structured_edit")
         registry.register("planner", planner_client)
         registry.register("coder", coder_client)
-        from daedalus.application.inspection import RepositoryInspector
-        worker = ModelWorker(client=coder_client, budget=shared,
-                             inspection_context=RepositoryInspector())
-        if repo_path:
-            worker.reference_context = lambda context: self.rag.context(
-                repo_path, context.node.objective + "\n" + context.revision_feedback,
-                phase="regression" if context.revision_feedback else "execution",
-                client=planner_client, budget=worker.budget,
-                target_paths=context.node.expected_artifacts,
-                output_tokens=worker.desired_output_tokens(context),
-            )
-            worker.investigate_context = lambda context,query,gap: self.rag.context(
-                repo_path,query+"\nEvidence gap: "+gap,phase="investigation",mode="deep",
-                client=planner_client,budget=worker.budget,
-                target_paths=context.node.expected_artifacts,
-                output_tokens=worker.desired_output_tokens(context),
-            )
+        worker = build_model_worker(
+            coder_client, budget=shared, repo_path=repo_path,
+            rag=self.rag, reference_client=planner_client,
+        )
         tier2 = None
         if enable_review or use_model:
             reviewer_client = self.build_model_client("reviewer")
@@ -504,6 +506,7 @@ def create_app(
             "infrastructure/keychain.py",
             "application/verification_probes.py", "service/verification_routes.py",
             "application/coding_worker.py", "application/planner.py",
+            "application/worker_factory.py", "application/worker_checks.py",
             "application/gatekeeper/tier2.py",
             "application/gatekeeper/tier1.py",
             "application/orchestrator.py", "application/intake.py",
@@ -715,11 +718,14 @@ def create_app(
 
     @app.get("/api/runs/{run_id}")
     def get_run(run_id: str) -> dict[str, Any]:
+        from daedalus.application.delivery_evidence import delivery_view
+
         run = _run_or_404(run_id)
         spec = _store().get_spec(str(run["spec_digest"]))
         commits = _run_commits(run_id)
         return {
             "run": {**run, "spec_digest": str(run["spec_digest"])},
+            "delivery": delivery_view(_store(), run),
             "spec": (
                 {
                     "goal_id": str(spec["goal_id"]),
@@ -871,6 +877,14 @@ def create_app(
                 commits[node_id] = commit
         return commits
 
+    def _public_gate_checks(evidence_json) -> list:
+        from daedalus.application.requirement_evidence import project_behavior_results
+
+        checks = json.loads(str(evidence_json or "{}")).get("checks", [])
+        for check in checks:
+            project_behavior_results(check.get("evidence", {}))
+        return checks
+
     def _step_view(step: dict[str, Any], commits: dict[str, str]) -> dict[str, Any]:
         step_id = str(step["step_id"])
         artifacts = [
@@ -922,7 +936,7 @@ def create_app(
                     # The individual deterministic checks, so a reviewer sees which one failed
                     # rather than only that the gate said no.
                     "checks": (
-                        json.loads(str(row["evidence"] or "{}")).get("checks", [])
+                        _public_gate_checks(row["evidence"])
                         if int(row["tier"]) == 1
                         else []
                     ),
@@ -937,14 +951,16 @@ def create_app(
     def run_trunk(run_id: str) -> dict[str, Any]:
         """Recorded trunk evidence and isolated branch history, without running checks."""
         _run_or_404(run_id)
-        return trunk_view(_store(), run_id)
+        return public_trunk(trunk_view(_store(), run_id))
 
     @app.get("/api/runs/{run_id}/plan")
     def plan_graph(run_id: str) -> dict[str, Any]:
         """The DAG with each node's live state, for the console's graph view."""
+        from daedalus.application.requirement_evidence import public_criterion_preview
+
         bundle = _bundle_for(run_id)
         steps = {str(step["node_id"]): step for step in _store().list_steps(run_id)}
-        trunk = trunk_view(_store(), run_id)
+        trunk = public_trunk(trunk_view(_store(), run_id))
         expectations = {node["node_id"]: node for node in trunk["nodes"]}
         nodes = []
         for node in bundle.plan.nodes:
@@ -958,7 +974,7 @@ def create_app(
                     "deps": list(node.deps),
                     "expected_artifacts": list(node.expected_artifacts),
                     "acceptance_criteria": [
-                        criterion.to_dict() for criterion in (
+                        public_criterion_preview(criterion.to_dict()) for criterion in (
                             node.acceptance_criteria or bundle.goal.acceptance_criteria
                         )
                     ],
@@ -1013,13 +1029,13 @@ def create_app(
     @app.get("/api/runs/{run_id}/validations")
     def run_validations(run_id: str) -> dict[str, Any]:
         _run_or_404(run_id)
-        return _validation_service().view(run_id)
+        return public_validation_view(_validation_service().view(run_id))
 
 
     @app.post("/api/runs/{run_id}/validations/evaluate")
     def evaluate_validation(run_id: str) -> dict[str, Any]:
         _run_or_404(run_id)
-        return _validation_service().evaluate(run_id)
+        return public_validation_report(_validation_service().evaluate(run_id))
 
 
     @app.post("/api/runs/{run_id}/validations/{validation_id}/attest")
@@ -1041,7 +1057,7 @@ def create_app(
     def run_goal_audit(run_id: str) -> dict[str, Any]:
         from daedalus.application.goal_audit import goal_audit_view
         _run_or_404(run_id)
-        return goal_audit_view(_store(), run_id)
+        return public_goal_audit(goal_audit_view(_store(), run_id))
 
     @app.get("/api/runs/{run_id}/score")
     def run_score(run_id: str) -> dict[str, Any]:
@@ -1058,19 +1074,21 @@ def create_app(
 
     @app.get("/api/runs/{run_id}/specs")
     def run_specs(run_id: str) -> dict[str, Any]:
-        """The frozen contract as four specs, each with a summary and its full document.
+        """The frozen contract as four specs with summaries and public previews.
 
         The planning module needs a *summary* to show collapsed and the whole spec to show
         expanded. Returning both in one call lets the panel expand without a second round trip
         and without the console re-deriving a summary from the document by hand — a summary
         computed in two places is a summary that disagrees with itself.
         """
+        from daedalus.application.requirement_evidence import project_behavior_previews
+
         run = _run_or_404(run_id)
         digest = str(run["spec_digest"])
         row = _store().get_spec(digest)
         if row is None:
             raise HTTPException(status_code=409, detail="this run records no registered spec")
-        document = json.loads(str(row["document"]))
+        document = project_behavior_previews(json.loads(str(row["document"])))
         approval = state.spec_approvals.approval_view(digest)
         return {
             "spec_digest": digest,
@@ -1126,7 +1144,9 @@ def create_app(
 
     @app.get("/api/specs/{spec_digest}")
     def spec_document(spec_digest: str) -> dict[str, Any]:
-        """The frozen contract itself: SPEC-01, SPEC-02, SPEC-03 and the Meta-Spec."""
+        """Public frozen contract summary and authoritative digest."""
+        from daedalus.application.requirement_evidence import project_behavior_previews
+
         rows = _store().connection.execute("SELECT spec_digest FROM specs").fetchall()
         matches = [
             str(row["spec_digest"])
@@ -1144,7 +1164,7 @@ def create_app(
             "owner_id": str(row["owner_id"]),
             "approved_at": row["approved_at"],
             "approved_by": row["approved_by"],
-            "document": json.loads(str(row["document"])),
+            "document": project_behavior_previews(json.loads(str(row["document"]))),
             **state.spec_approvals.approval_view(matches[0]),
         }
 
@@ -1301,8 +1321,8 @@ def create_app(
                 else None
             ),
             "steps": steps,
-            "goal_audit": goal_audit_view(_store(), run_id),
-            "independent_validation": _validation_service().view(run_id),
+            "goal_audit": public_goal_audit(goal_audit_view(_store(), run_id)),
+            "independent_validation": public_validation_view(_validation_service().view(run_id)),
             "commits": commits,
             "approvals": _store().approvals_for_run(run_id),
         }
@@ -1323,7 +1343,9 @@ def create_app(
                     "actor": event.actor,
                     "step_id": event.step_id,
                     "event_type": event.event_type,
-                    "detail": json.dumps(dict(event.payload), sort_keys=True)[:2000],
+                    "detail": json.dumps(
+                        public_event_payload(event.event_type, dict(event.payload)), sort_keys=True,
+                    )[:2000],
                     "reference": event.event_id,
                 }
             )
@@ -1632,11 +1654,26 @@ def create_app(
         return {"intake": session.to_payload()}
 
     @app.post("/api/intakes/{intake_id}/spec")
-    def derive_intake_spec(intake_id: str) -> dict[str, Any]:
+    def derive_intake_spec(
+        intake_id: str, request: IntakeDeriveRequest | None = None,
+    ) -> dict[str, Any]:
         """Derive the spec from the answers. This does not start anything."""
         session = _intake_or_404(intake_id)
+        qualification = None
+        if request and request.requirement_check_id:
+            from daedalus.service.requirement_routes import load_ready
+
+            plan_request = state.intake.request_for(session)
+            qualification = load_ready(
+                state, request.requirement_check_id, Path(session.repo_path),
+                plan_request.objective, plan_request.target_paths,
+            )
+        if request and request.require_behavior_paths:
+            _require_behavior_paths(qualification)
         try:
-            _, bundle, adjustments = state.intake.derive(session.intake_id)
+            session, bundle, adjustments = state.intake.derive(
+                session.intake_id, qualification=qualification,
+            )
         except IntakeModelUnavailable as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         except ModelError as error:
@@ -1645,12 +1682,20 @@ def create_app(
             # The model proposed a spec the control plane refuses. That is a 422 with the
             # reason, not a silent repair: the operator is about to freeze this contract.
             raise HTTPException(status_code=422, detail=str(error)) from error
-        document = bundle.to_dict()
+        except (ValueError, TypeError, KeyError, SyntaxError):
+            raise HTTPException(409, "the plan does not match the qualified requirement") from None
+        if qualification is None:
+            document = bundle.to_dict()
+        else:
+            from daedalus.application.requirement_evidence import preview_qualified_bundle
+
+            document = preview_qualified_bundle(bundle)
         return {
             "intake": session.to_payload(with_document=document),
             "document": document,
             "spec_digest": bundle.digest(),
             "adjustments": list(adjustments),
+            "requirement_check_id": request.requirement_check_id if qualification else "",
             # The same card summaries the 规划 panel shows, built by the same server-side
             # function. A review screen that summarised the spec its own way would eventually
             # describe a different contract than the one being frozen.
@@ -1682,6 +1727,39 @@ def create_app(
         except DaedalusError as error:
             raise HTTPException(status_code=409, detail=error.message) from None
 
+        from daedalus.application.requirement_evidence import bound_qualification
+        from daedalus.infrastructure.repository_lock import repository_lock
+        from daedalus.service.requirement_routes import load_ready
+
+        try:
+            proof = bound_qualification(bundle)
+        except (ValueError, KeyError, TypeError, SyntaxError):
+            raise HTTPException(409, "the reviewed requirement proof is invalid") from None
+        if proof is None:
+            if request.require_behavior_paths:
+                _require_behavior_paths(None)
+            return _submit_reviewed_intake(session, request, bundle)
+        repo = Path(session.repo_path)
+        with repository_lock(repo):
+            qualification = load_ready(
+                state, proof["check_id"], repo, bundle.goal.objective, bundle.boundary.fs_whitelist,
+            )
+            _, ready = qualification
+            if request.require_behavior_paths:
+                _require_behavior_paths(qualification)
+            if ready != proof:
+                raise HTTPException(409, "the reviewed requirement proof has changed")
+            orchestrator = _prepare_reviewed_intake(
+                session, request, bundle, base_ref=proof["base_commit"],
+            )
+        return _dispatch_reviewed_intake(session, bundle, orchestrator)
+
+    def _submit_reviewed_intake(session, request, bundle):
+        return _dispatch_reviewed_intake(
+            session, bundle, _prepare_reviewed_intake(session, request, bundle),
+        )
+
+    def _prepare_reviewed_intake(session, request, bundle, *, base_ref="HEAD"):
         budget = TokenBudget(max_tokens_per_run=state.settings.quota.max_tokens_per_run)
         worker, tier2 = state.build_worker(
             use_model=request.use_model, enable_review=request.enable_review, budget=budget,
@@ -1707,7 +1785,10 @@ def create_app(
             raise HTTPException(status_code=428, detail=str(error)) from error
 
         # The receipt must already be readable when the browser follows its run id.
-        orchestrator.create_run()
+        orchestrator.create_run(base_ref=base_ref)
+        return orchestrator
+
+    def _dispatch_reviewed_intake(session, bundle, orchestrator):
         receipt = state.dispatcher.submit(
             orchestrator.run_id, session.repo_path, orchestrator.run
         )
@@ -1726,6 +1807,14 @@ def create_app(
         session = _intake_or_404(intake_id)
         return {"intake": state.intake.abandon(session.intake_id).to_payload()}
 
+    def _require_behavior_paths(qualification):
+        from daedalus.application.requirement_evidence import require_path_qualification
+
+        try:
+            require_path_qualification(qualification[0] if qualification else None)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
+
     # --------------------------------------------------------------- commands
     @app.post("/api/runs", status_code=202)
     def create_run(request: RunRequest) -> dict[str, Any]:
@@ -1738,10 +1827,16 @@ def create_app(
             with repository_lock(repo):
                 checked = load_ready(state, request.requirement_check_id, repo,
                                      request.objective, request.target_paths)
-                return _accept_run(request, repo, checked)
-        return _accept_run(request, repo)
+                if request.require_behavior_paths:
+                    _require_behavior_paths(checked)
+                orchestrator = _prepare_run(request, repo, checked)
+        else:
+            if request.require_behavior_paths:
+                _require_behavior_paths(None)
+            orchestrator = _prepare_run(request, repo)
+        return _dispatch_run(request, repo, orchestrator)
 
-    def _accept_run(request: RunRequest, repo: Path, checked=None) -> dict[str, Any]:
+    def _prepare_run(request: RunRequest, repo: Path, checked=None):
         planner_request = PlanRequest(
             request_id="REQ-API",
             goal_id=request.goal_id,
@@ -1773,15 +1868,17 @@ def create_app(
             )
         else:
             planner = DeterministicPlanner(bounds=ResourceBounds.for_quota(state.settings.quota))
+        if checked:
+            from daedalus.application.requirement_evidence import with_behavior_path_context
+
+            planner_request = with_behavior_path_context(planner_request, checked)
         bundle = planner.plan(planner_request)
         if checked:
-            from dataclasses import replace
-            from daedalus.application.requirement_evidence import bind_bundle
-            # The qualified run uses the same kernel policy as its baseline check.
-            bundle = replace(bundle, boundary=replace(bundle.boundary, isolation="seatbelt"))
+            from daedalus.application.requirement_evidence import bind_qualified_bundle
+
             try:
-                bundle = bind_bundle(bundle, *checked)
-            except ValueError:
+                bundle = bind_qualified_bundle(bundle, *checked)
+            except (ValueError, TypeError, KeyError, SyntaxError):
                 raise HTTPException(409, "the plan no longer matches the qualified requirement "
                                     "scope or goal") from None
 
@@ -1807,6 +1904,10 @@ def create_app(
         # supposed to be durable, and it is not durable if following it 404s until the
         # background worker happens to reach `create_run`.
         orchestrator.create_run(base_ref=checked[1]["base_commit"] if checked else "HEAD")
+        return orchestrator
+
+    def _dispatch_run(request: RunRequest, repo: Path, orchestrator) -> dict[str, Any]:
+        bundle = orchestrator.bundle
 
         receipt = state.dispatcher.submit(
             orchestrator.run_id, str(repo), orchestrator.run
@@ -1823,7 +1924,7 @@ def create_app(
             "spec_digest": bundle.digest(),
             "risk_level": bundle.goal.risk_level.value,
             "whitelist": list(bundle.boundary.fs_whitelist),
-            **({"requirement_check_id": request.requirement_check_id} if checked else {}),
+            **({"requirement_check_id": request.requirement_check_id} if request.requirement_check_id else {}),
         }
 
     @app.post("/api/runs/{run_id}/approve")
@@ -1898,6 +1999,28 @@ def create_app(
         if not repo_path:
             raise HTTPException(status_code=409, detail="the run records no repository path")
         bundle = _bundle_for(run_id)
+        selection = None
+        if request.spec_digest:
+            from daedalus.application.replay import plan_selective_replay
+
+            row = _store().get_spec(request.spec_digest)
+            if row is None:
+                raise HTTPException(404, "the revised spec is not registered")
+            revised = SpecBundle.from_dict(json.loads(str(row["document"])))
+            revised.validate()
+            if revised.digest() != request.spec_digest or revised.goal.goal_id != bundle.goal.goal_id:
+                raise HTTPException(409, "the revised spec does not match this task")
+            if bundle.goal.risk_level.rank > revised.goal.risk_level.rank:
+                raise HTTPException(409, "selective replay cannot lower the source run's risk")
+            from daedalus.application.requirement_evidence import is_behavior
+
+            if any(is_behavior(c) and c not in revised.goal.acceptance_criteria
+                   for c in bundle.goal.acceptance_criteria):
+                raise HTTPException(409, "selective replay cannot remove a frozen behavior check")
+            if request.rollback_first:
+                raise HTTPException(409, "a revised spec starts a new execution; do not roll back its source run")
+            selection = plan_selective_replay(bundle, revised)
+            bundle = revised
         replay_from = request.from_commit.strip() or str(run["base_commit"])
         if request.from_commit.strip():
             known = _known_commits(run_id)
@@ -1914,7 +2037,9 @@ def create_app(
                 run_id, reason=request.reason, to_commit=request.from_commit.strip()
             )
 
-        worker, tier2 = state.build_worker(use_model=request.use_model, enable_review=False)
+        worker, tier2 = state.build_worker(
+            use_model=request.use_model, enable_review=False, repo_path=repo_path,
+        )
         orchestrator = build_orchestrator(
             settings=state.settings,
             store=state.store,
@@ -1924,10 +2049,16 @@ def create_app(
             tier2=tier2,
             run_root=state.settings.workspace.worktrees_path / "replays",
             identity=state.identity,
+            reuse_artifacts=True,
         )
         orchestrator.parent_execution_id = str(run["execution_id"])
         orchestrator.replay_from_commit = replay_from
-        orchestrator.reuse_artifacts = True
+        if selection is not None:
+            orchestrator.replay_reusable_nodes = selection.reusable_nodes
+            try:
+                orchestrator.assert_spec_may_run()
+            except SpecApprovalRequired as error:
+                raise HTTPException(428, detail=str(error)) from error
         orchestrator.register_spec()
         orchestrator.create_run()
         receipt = state.dispatcher.submit(orchestrator.run_id, repo_path, orchestrator.run)
@@ -1935,6 +2066,8 @@ def create_app(
             **receipt.describe(),
             "replayed_execution_id": str(run["execution_id"]),
             "replay_from_commit": replay_from,
+            **({"selective_replay": selection.describe(), "spec_digest": bundle.digest()}
+               if selection is not None else {}),
         }
 
     def _known_commits(run_id: str) -> set[str]:

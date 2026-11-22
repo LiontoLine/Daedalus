@@ -521,3 +521,65 @@ def test_known_task_replay_requires_separate_bounded_authorization(
         realwork.run_realwork(destination, object(), stop_requested=lambda: False,
                              replay=replay, max_tokens=90000, max_calls=18)
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_native_public_and_hidden_evaluation_never_falls_back_to_host(
+    tmp_path, monkeypatch, unavailable,
+):
+    from dataclasses import replace
+
+    from daedalus.application.benchmark import _setup
+    from daedalus.application.benchmark_cases import CONTROLLED_CASES
+    from daedalus.infrastructure.sandbox import CommandOutcome, IsolationUnavailable
+
+    marker = tmp_path / "unisolated-evaluation"
+    untrusted = f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n"
+    case = replace(CONTROLLED_CASES[0], public=untrusted)
+    root = tmp_path / "trial"
+    root.mkdir()
+    repo, bundle, _ = _setup(case, root, 30000)
+    commit = _git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
+    task = {
+        "_hidden_verifier": "verify_hidden.py",
+        "test_patch": (
+            "diff --git a/verify_hidden.py b/verify_hidden.py\n"
+            "new file mode 100644\n--- /dev/null\n+++ b/verify_hidden.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            + "\n".join("+" + line for line in untrusted.splitlines()) + "\n"
+        ),
+    }
+    commands = []
+
+    def deny(**options):
+        commands.append(options["command"])
+        return CommandOutcome(
+            " ".join(options["command"]), 1, "", "isolated execution denied", 0,
+            driver="selected-isolated-driver",
+        )
+
+    choice = SimpleNamespace(
+        driver=SimpleNamespace(run=deny),
+        describe=lambda: {"selected": "selected-isolated-driver"},
+    )
+
+    def select(boundary, *, requested):
+        assert requested == "auto"
+        if unavailable:
+            raise IsolationUnavailable("selected driver is unavailable")
+        return choice
+
+    monkeypatch.setattr(
+        realwork.DriverRegistry, "default",
+        lambda: SimpleNamespace(select=select),
+    )
+    if unavailable:
+        with pytest.raises(IsolationUnavailable):
+            realwork._evaluate(repo, bundle, task, root, commit)
+        assert not commands
+    else:
+        outcome = realwork._evaluate(repo, bundle, task, root, commit)
+        assert outcome["hidden_patch_applied"]
+        assert not outcome["public_passed"] and not outcome["heldout_passed"]
+        assert commands == [["python3", "verify_public.py"], ["python3", "verify_hidden.py"]]
+    assert not marker.exists()

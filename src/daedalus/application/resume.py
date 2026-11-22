@@ -72,7 +72,14 @@ def load_manifest(store: EventStore, run_id: str) -> RunManifest:
         )
     import json
 
-    bundle = SpecBundle.from_dict(json.loads(str(spec["document"])))
+    try:
+        bundle = SpecBundle.from_dict(json.loads(str(spec["document"])))
+        bundle.validate()
+        if bundle.digest() != str(run["spec_digest"]):
+            raise ValueError("frozen spec digest mismatch")
+    except (ValueError, KeyError, TypeError, DaedalusError):
+        raise ResumeError("the persisted spec no longer matches the frozen execution",
+                          run_id=run_id) from None
     return RunManifest(
         run_id=run_id,
         execution_id=str(run["execution_id"]),
@@ -110,21 +117,33 @@ def resume_run(
     from daedalus.application.service_lifecycle import assert_checkpoint_reviewed
     assert_checkpoint_reviewed(store, run_id, identity=identity)
 
+    from daedalus.application.goal_audit import settled_goal_approval
+    from daedalus.infrastructure.git_sandbox import _git
+
     from daedalus.application.independent_validation import pending_validation
     validation_delivery = pending_validation(store,run_id) is not None
     started = next((event.payload for event in store.events_for_execution(manifest.execution_id)
                     if event.event_type == "RunStarted"), {})
-    if (store.events_for(f"goal:{run_id}") or started.get("goal_stage_parent")) and not validation_delivery:
-        raise ResumeError(
-            "goal-audit stages require manual recovery or an explicitly reviewed new task; "
-            "resume cannot reset their iteration budget", run_id=run_id,
-        )
-
-    if any(step["state"] == "COMMITTING" for step in store.list_steps(run_id)):
-        raise ResumeError("unfinished commit requires reconciliation; inspect `daedalus recover`. If it cannot be reconciled, rollback/replay deliberately", run_id=run_id)
-    from daedalus.infrastructure.git_sandbox import _git
-    if not _git(Path(manifest.repo_path), ["rev-parse", "--verify", "refs/heads/" + manifest.run_branch], check=False).ok:
+    steps = store.list_steps(run_id)
+    head = _git(Path(manifest.repo_path), [
+        "rev-parse", "--verify", "refs/heads/" + manifest.run_branch,
+    ], check=False)
+    if not head.ok:
         raise ResumeError("the recorded integration branch is missing; refusing to recreate evidence", run_id=run_id)
+    if (store.events_for(f"goal:{run_id}") or started.get("goal_stage_parent")) and not validation_delivery:
+        committed = {step["node_id"] for step in steps
+                     if step["state"] == "COMMITTED" and step["execution_id"] == manifest.execution_id}
+        if (started.get("goal_stage_parent")
+                or committed != {node.node_id for node in manifest.bundle.plan.nodes}
+                or not settled_goal_approval(
+                    store, run_id, manifest.execution_id, manifest.spec_digest, head.stdout.strip(),
+                )):
+            raise ResumeError(
+                "goal-audit stages require manual recovery unless the exact final approval is settled; "
+                "resume cannot reset their iteration budget", run_id=run_id,
+            )
+    if any(step["state"] == "COMMITTING" for step in steps):
+        raise ResumeError("unfinished commit requires reconciliation; inspect `daedalus recover`. If it cannot be reconciled, rollback/replay deliberately", run_id=run_id)
     saved_quota = dict(started.get("quota", {}))
     saved_quota["max_parallel_steps"] = min(max_parallel_steps, int(saved_quota.get("max_parallel_steps", max_parallel_steps)))
 
@@ -145,6 +164,8 @@ def resume_run(
         quota=Quota(**saved_quota),
         run_id=manifest.run_id,
         execution_id=manifest.execution_id,
+        parent_execution_id=str(started.get("parent_execution_id") or ""),
+        replay_from_commit=str(started.get("replay_from_commit") or ""),
         correlation_id=str(store.get_run(run_id)["correlation_id"]),
         park_on_escalation=park_on_escalation,
         manual_review_levels=tuple(sorted(set(started.get("manual_review_levels", ())) | set(manual_review_levels))),
@@ -155,6 +176,11 @@ def resume_run(
         # after the run parked.
         identity=identity,
         resume=True,
+        reuse_artifacts=bool(started.get("reuse_artifacts", False)),
+        replay_reusable_nodes=(
+            tuple(started["replay_reusable_nodes"])
+            if isinstance(started.get("replay_reusable_nodes"), list) else None
+        ),
         target_branch=str(started.get("target_branch") or "main"),
         goal_audit_enabled=bool(started.get("goal_audit_enabled", False)),
         independent_validation_levels=tuple(started.get("independent_validation_levels", ())),

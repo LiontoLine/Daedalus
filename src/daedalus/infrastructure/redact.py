@@ -259,10 +259,18 @@ def assert_clean(payload: Any, *, where: str) -> None:
 
     Used by the tests and by the audit/artifact writers as a last line of defence.
     """
-    text = repr(redact(payload))
-    original = repr(payload)
-    if REDACTED in text:
-        return
-    for name, pattern in _PATTERNS:
-        if pattern.search(original):
-            raise ValueError(f"unredacted secret ({name}) detected in {where}")
+    pending = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                name = str(key)
+                if is_secret_key(name) and item not in (None, "", REDACTED):
+                    raise ValueError(f"unredacted secret field detected in {where}")
+                pending.extend((name, item))
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+        elif isinstance(value, str) and redact_text(value) != value:
+            # Inspect actual strings with the same JSON/Python-reference semantics
+            # as redaction. repr(container) is not the source and changes its syntax.
+            raise ValueError(f"unredacted secret detected in {where}")

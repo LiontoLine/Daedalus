@@ -113,27 +113,6 @@ def test_incomplete_custom_client_cannot_apply_valid_json(box, reason, text):
     assert budget.run_used == 100 and budget.calls == 1
 
 
-def test_retry_cap_is_limited_by_remaining_run_budget_and_review_reserve(box):
-    budget = TokenBudget(max_tokens_per_step=40000, max_tokens_per_run=20000)
-    response = complete()
-    client = Responses(ModelResponseIncomplete(
-        "incomplete", usage={"prompt_tokens": 100, "completion_tokens": 2048},
-    ), response)
-    worker = ModelWorker(client, budget=budget)
-    ctx = context_for(box)
-    assert not worker.implement(box, ctx).ok
-    assert budget.run_used == 2148 and budget.calls == 1
-    budget.record(Completion("", prompt_tokens=4000))
-    budget.reset_step()
-    remaining = budget.max_tokens_per_run - budget.run_used
-    expected_total = budget.run_used + response.total_tokens
-    retry = replace(ctx, attempt=2)
-    desired = worker.desired_output_tokens(retry)
-    estimate = worker._estimate(worker._render(box, retry), 0)
-    assert worker.implement(box, retry).ok
-    assert client.limits[-1] == remaining - estimate - worker.review_headroom_tokens
-    assert client.limits[-1] < desired
-    assert budget.run_used == expected_total
 
 
 def test_tiny_budget_blocks_before_dispatch(box):

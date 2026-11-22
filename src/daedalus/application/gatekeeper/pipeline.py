@@ -154,8 +154,9 @@ class Gatekeeper:
             )
 
         try:
+            patch = sandbox.diff().patch
             reference_context = dependency_context(
-                sandbox, artifact.changed_files, query=goal_intent + "\n" + sandbox.diff().patch
+                sandbox, artifact.changed_files, query=goal_intent + "\n" + patch
             )
         except Exception as error:  # noqa: BLE001 - fail closed before spending on missing evidence
             from daedalus.errors import DaedalusError
@@ -171,7 +172,10 @@ class Gatekeeper:
                 tier1_result_id=tier1_result_id, tier2_result_id=new_id("gate"),
                 skipped_tier2=True,
             )
-        behavior = [row["behavior_evidence"] for check in tier1_report.checks
+        from daedalus.application.requirement_evidence import model_behavior_evidence
+
+        behavior = [model_behavior_evidence(row["behavior_evidence"])
+                    for check in tier1_report.checks
                     for row in check.evidence.get("criteria", []) if row.get("behavior_evidence")]
         request = SemanticReviewRequest(
             step_id=artifact.step_id,
@@ -181,7 +185,7 @@ class Gatekeeper:
             node_intent=node_intent,
             acceptance_criteria=acceptance_criteria,
             changed_files=artifact.changed_files,
-            patch=sandbox.diff().patch,
+            patch=patch,
             execution_log=execution_log,
             tier1_summary="; ".join(
                 f"{c.name}={'pass' if c.passed else 'FAIL'}" for c in tier1_report.checks

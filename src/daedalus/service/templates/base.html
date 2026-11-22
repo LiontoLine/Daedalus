@@ -8,7 +8,7 @@
      deliberately offline, and `pip install` remains the only install step. The vendored files
      are pinned by digest in static/vendor/MANIFEST.json. #}
   <link rel="stylesheet" href="/static/vendor/diff2html.min.css" />
-  <link rel="stylesheet" href="/static/console.css?v=lifecycle-20261024-1" />
+  <link rel="stylesheet" href="/static/console.css?v=chat-workspace-2" />
   <link rel="stylesheet" href="/static/engineering.css?v=20261027-3" />
 </head>
 <body data-page="{{ 'workflow' if page in ['intake', 'planning', 'execution', 'audit', 'workflow'] else page }}" data-initial-stage="{{ {'planning': 'plan', 'execution': 'execute', 'audit': 'audit'}.get(page, 'task') }}"{% if run_id %} data-run-id="{{ run_id }}"{% endif %}>
@@ -47,7 +47,7 @@
   </footer>
 
   <script src="/static/vendor/diff2html.min.js"></script>
-  <script src="/static/console.js?v=lifecycle-20261024-1"></script>
+  <script src="/static/console.js?v=chat-workspace-2"></script>
   <script src="/static/engineering.js?v=20261027-4"></script>
   {% block scripts %}{% endblock %}
 </body>

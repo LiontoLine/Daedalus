@@ -437,13 +437,21 @@ def _check_network_posture(settings: Settings) -> CheckResult:
 
 def _check_isolation(settings: Settings) -> CheckResult:
     report = run_preflight(settings)
+    selected = next((driver for driver in report.drivers if driver.driver == report.selected), None)
+    if selected is None or not selected.available:
+        return CheckResult(
+            name="process_isolation_available", category="runtime", status=CheckStatus.FAIL,
+            detail="no available driver satisfies the deployment's configured network policy",
+            evidence={"selected": report.selected, "gaps": list(report.gaps)},
+            remediation="provide a compatible isolation runtime and rerun the deployment probe",
+        )
     process_gap = next((gap for gap in report.gaps if "no process isolation" in gap), "")
-    if process_gap:
+    if not selected.process_isolation.enforced:
         return CheckResult(
             name="process_isolation_available",
             category="runtime",
             status=CheckStatus.WARN,
-            detail=f"selected {report.selected}: {process_gap}",
+            detail=f"selected {report.selected}: {process_gap or 'process isolation is not enforced'}",
             evidence={"gaps": list(report.gaps), "drivers": [r.driver for r in report.drivers]},
             remediation=(
                 "acceptable for trusted tasks, but a production deployment handling untrusted "

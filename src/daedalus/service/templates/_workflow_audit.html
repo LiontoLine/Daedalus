@@ -5,29 +5,15 @@
 <section class="panel"><header class="panel-head"><h2>合规与证据完整度</h2><span class="muted">点击分项查看依据</span></header><div id="audit-main"></div>
 </section>
 
-<section class="panel">
-  <header class="panel-head">
-    <div>
-      <h2>交付记录</h2>
-      <p class="panel-sub">谁 / 何时 / 哪个 spec / 哪个 model / 哪个 image / 改了什么 /
-        跑了什么 / 测试结果 / 谁批准 / 最终 commit</p>
-    </div>
-  </header>
-  <div id="audit" class="muted">loading…</div>
-</section>
-
-<section class="panel">
-  <header class="panel-head">
-    <div>
-      <h2>证据一致性</h2>
-      <p class="panel-sub">verify / recover / 告警 / 身份 / 指标</p>
-    </div>
-    <div class="controls"><a class="button ghost" href="/operations">运维详情</a></div>
-  </header>
-  <div id="identity-out" class="muted">loading…</div>
+<details class="panel secondary-details"><summary>完整交付记录 <span class="muted">提交 · 验收 · 审批</span></summary>
+  <div id="audit" class="muted">等待交付记录…</div>
+</details>
+<details class="panel secondary-details"><summary>证据一致性与指标</summary>
+  <div class="controls"><a class="button ghost small" href="/operations">查看运行环境</a></div>
+  <div id="identity-out" class="muted">等待读取…</div>
   <div id="metrics-bars" class="metrics-bars"></div>
   <pre id="metrics" class="code" hidden></pre>
-</section>
+</details>
 </div>
 <div id="audit-view-changes" role="tabpanel" aria-labelledby="audit-tab-changes" data-audit-view="changes" hidden><section class="panel">
   <header class="panel-head">

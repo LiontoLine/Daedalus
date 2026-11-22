@@ -28,6 +28,10 @@ class WorkerContext:
     revision_feedback: str = ""
     input_artifacts: tuple[Artifact, ...] = ()
     repair_memory: tuple[dict[str, Any], ...] = ()
+    deadline_monotonic: float = 0.0
+    # Controller-owned negative evidence, scoped to this execution/node/spec/base.
+    # Unlike repair_memory, this is never populated from plan text or replay history.
+    rejected_candidate_trees: frozenset[str] = frozenset()
 
     @property
     def writable_paths(self) -> tuple[str, ...]:

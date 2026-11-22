@@ -636,7 +636,9 @@ class IntakeService:
             request = _with_attempts(request, int(max_attempts))
         return request
 
-    def derive(self, intake_id: str) -> tuple[IntakeSession, SpecBundle, tuple[str, ...]]:
+    def derive(
+        self, intake_id: str, *, qualification: tuple[dict, dict] | None = None,
+    ) -> tuple[IntakeSession, SpecBundle, tuple[str, ...]]:
         """Produce the spec from the answers. The model is required; failures are reported."""
         session = self.load(intake_id)
         if session.status in {"FROZEN", "ABANDONED"}:
@@ -647,7 +649,15 @@ class IntakeService:
             from dataclasses import replace
             reference = self.reference_context_factory(session.repo_path, request, planner.budget)
             request = replace(request, extra_context=request.extra_context + reference)
+        if qualification is not None:
+            from daedalus.application.requirement_evidence import with_behavior_path_context
+
+            request = with_behavior_path_context(request, qualification)
         bundle = planner.plan(request)
+        if qualification is not None:
+            from daedalus.application.requirement_evidence import bind_qualified_bundle
+
+            bundle = bind_qualified_bundle(bundle, *qualification)
         adjustments = tuple(getattr(planner, "last_adjustments", ()) or ())
         # A content-addressed snapshot is the reviewed contract; freeze must never re-plan.
         from daedalus.application.service_lifecycle import atomic_json

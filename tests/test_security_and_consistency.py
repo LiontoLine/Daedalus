@@ -40,7 +40,7 @@ from daedalus.domain.spec import (
     RiskLevel,
     SpecBundle,
 )
-from daedalus.infrastructure.redact import REDACTED, redact_text
+from daedalus.infrastructure.redact import REDACTED, assert_clean, redact_text
 from daedalus.infrastructure.store import EventStore
 from daedalus.model.base import Completion, Message
 from daedalus.security.outbound import (
@@ -82,12 +82,20 @@ def test_the_scanner_finds_credential_shapes_without_returning_values() -> None:
     "build_token(secret=self.secret)",
     "secret = settings.SECRET_KEY",
 ])
-def test_computed_credential_references_are_not_literal_credentials(source):
+def test_computed_credential_references_are_not_literal_credentials(source, tmp_path):
     assert scan_text(source) == ()
     assert redact_text(source) == source
     encoded = json.dumps({"candidate_sources": [{"text": source}]})
     assert scan_text(encoded) == ()
     assert redact_text(encoded) == encoded
+    with EventStore(tmp_path / "symbolic-source.db") as store:
+        event = store.append(
+            aggregate_id="run:symbolic-source", event_type="WorkerEngineeringObserved",
+            execution_id="exec:symbolic-source",
+            actor="test", payload={"source": source, "observation": encoded},
+        )
+        assert event.payload["source"] == source
+        assert event.payload["observation"] == encoded
 
 
 @pytest.mark.parametrize("source", [
@@ -527,3 +535,13 @@ def test_the_four_missing_metrics_are_now_reported(git_repo, tmp_path) -> None:
     assert metrics["queue_latency_ms"] >= 0
     assert metrics["resource_usage_cpu_seconds"] >= 0
     assert metrics["peak_parallel_steps"] >= 1
+
+
+@pytest.mark.parametrize("payload", [
+    {"already_scrubbed": REDACTED, "text": FAKE_SECRET},
+    {"text": json.dumps({"secret": "literal-credential"})},
+    {"password": "opaque-value-without-a-known-prefix"},
+])
+def test_clean_payload_guard_rejects_remaining_credentials_even_with_redacted_siblings(payload):
+    with pytest.raises(ValueError):
+        assert_clean(payload, where="persisted credential boundary")

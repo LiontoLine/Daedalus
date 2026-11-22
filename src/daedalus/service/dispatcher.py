@@ -261,6 +261,7 @@ def build_orchestrator(
     tier2=None,
     run_root: Path | None = None,
     identity=None,
+    reuse_artifacts: bool = False,
 ) -> RunOrchestrator:
     """Construct an orchestrator with every limit taken from configuration."""
     quota_settings = settings.quota
@@ -275,6 +276,7 @@ def build_orchestrator(
         worker=worker,
         tier2=tier2,
         goal_audit_enabled=True,
+        reuse_artifacts=reuse_artifacts,
         independent_validation_levels=tuple(settings.policy.independent_validation_levels),
         quota=Quota(
             max_parallel_steps=quota_settings.max_parallel_steps,

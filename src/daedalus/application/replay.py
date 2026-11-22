@@ -25,7 +25,7 @@ from daedalus.application.gatekeeper.pipeline import GateOutcome
 from daedalus.domain.canonical import digest_of
 from daedalus.domain.fsm import RunState, StepState
 from daedalus.domain.ids import new_id, utc_now
-from daedalus.domain.spec import SpecBundle
+from daedalus.domain.spec import SpecBundle, node_subject_digest
 from daedalus.errors import IllegalTransition, NotRollbackable, RollbackError
 from daedalus.infrastructure.store.event_store import EventStore
 
@@ -463,6 +463,14 @@ def plan_selective_replay(previous: SpecBundle, current: SpecBundle) -> Selectiv
         return SelectiveReplay(change=report, stale_nodes=all_nodes, reusable_nodes=())
 
     changed = set(report.changed_node_ids)
+    # Combined plan and boundary changes can reach a seemingly unchanged node.
+    # Results here are eligible for lookup, never an approval to reuse.
+    old_nodes = {node.node_id: node for node in previous.plan.nodes}
+    changed.update(
+        node.node_id for node in current.plan.nodes
+        if node.node_id in old_nodes and node_subject_digest(current, node)
+        != node_subject_digest(previous, old_nodes[node.node_id])
+    )
     if not changed:
         # The specs differ in a way the classifier did not attribute to a node (for example a
         # resource-limit change that reaches nothing). Fail closed: re-execute.

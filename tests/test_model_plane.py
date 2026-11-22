@@ -330,7 +330,15 @@ def test_an_unusable_model_edit_plan_fails_cleanly(git_repo, tmp_path, api_key) 
         gateway.stop()
     assert result.status != "COMPLETED"
     assert not result.commits
-    assert any("unusable" in step.feedback or "plan" in step.feedback for step in result.steps)
+    failures = [
+        event.payload.get("error_code") for event in store.events_for_execution(result.execution_id)
+        if event.event_type == "TrunkNodeFailed"
+    ]
+    assert "invalid_edit_plan" in failures
+    assert not any(
+        event.event_type == "StepGatekeeperEntered"
+        for event in store.events_for_execution(result.execution_id)
+    )
     store.close()
 
 

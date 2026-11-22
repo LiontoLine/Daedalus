@@ -117,11 +117,16 @@ def checkpoint(store, run_id: str) -> dict:
     if not head:
         blockers.append("原仓库或集成分支不可用，需要人工恢复")
     from daedalus.application.independent_validation import pending_validation
+    from daedalus.application.goal_audit import settled_goal_approval
 
     started = next((event.payload for event in events if event.event_type == "RunStarted"), {})
     if (
         store.events_for(f"goal:{run_id}") or started.get("goal_stage_parent")
-    ) and not pending_validation(store, run_id):
+    ) and not pending_validation(store, run_id) and not (
+        steps and all(step["state"] == "COMMITTED" for step in steps)
+        and not started.get("goal_stage_parent")
+        and settled_goal_approval(store, run_id, execution, str(run["spec_digest"]), head)
+    ):
         blockers.append(
             "目标审计或修复 stage 已有历史，需人工核对 stage；不会重置最多三轮的迭代预算"
         )

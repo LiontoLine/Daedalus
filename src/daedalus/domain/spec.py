@@ -320,6 +320,7 @@ class PlanSpec:
     schema_version: int = SPEC_SCHEMA_VERSION
     version: int = 1
     created_at: str = field(default_factory=utc_now)
+    integrated_acceptance: bool = False
 
     @property
     def spec_type(self) -> str:
@@ -334,6 +335,10 @@ class PlanSpec:
             raise SpecError("SPEC-02 requires at least one node")
         if self.schema_version != SPEC_SCHEMA_VERSION:
             raise SpecError(f"SPEC-02 schema_version must be {SPEC_SCHEMA_VERSION}")
+        if type(self.integrated_acceptance) is not bool:
+            raise SpecError("SPEC-02 integrated_acceptance must be boolean")
+        if self.integrated_acceptance and len(self.nodes) < 2:
+            raise SpecError("integrated acceptance is for a multi-node plan")
 
         seen: set[str] = set()
         for node in self.nodes:
@@ -414,6 +419,7 @@ class PlanSpec:
             "plan_id": self.plan_id,
             "goal_id": self.goal_id,
             "nodes": [node.to_dict() for node in self.nodes],
+            **({"integrated_acceptance": True} if self.integrated_acceptance else {}),
             "created_at": self.created_at,
         }
 
@@ -426,6 +432,7 @@ class PlanSpec:
             schema_version=int(raw.get("schema_version", SPEC_SCHEMA_VERSION)),
             version=int(raw.get("spec_version", 1)),
             created_at=str(raw.get("created_at") or utc_now()),
+            integrated_acceptance=raw.get("integrated_acceptance", False),
         )
         spec.validate()
         return spec
@@ -730,6 +737,8 @@ def node_subject_digest(bundle: "SpecBundle", node: PlanNode) -> str:
             "invariants": list(bundle.goal.invariants),
             "risk_level": bundle.goal.risk_level.value,
             "node": node.to_dict(),
+            # An older approval with wider write scope must not satisfy an owned DAG node.
+            **({"integrated_acceptance": True} if bundle.plan.integrated_acceptance else {}),
             "criteria": [criterion.to_dict() for criterion in criteria],
             "relevant_whitelist": list(relevant_whitelist),
             "denylist": sorted(boundary.fs_denylist),
@@ -790,25 +799,21 @@ class SpecBundle:
                     f"{criterion.path!r}, which SPEC-03 does not whitelist"
                 )
 
-        # If any node narrows acceptance to itself, the union must still cover the whole
-        # goal. Without this, a plan could assign each node a trivially true assertion and
-        # the goal would never actually be verified.
-        node_criteria = {
-            criterion.criterion_id: criterion
-            for node in self.plan.nodes
-            for criterion in node.acceptance_criteria
-        }
-        if node_criteria:
-            missing = [
-                criterion.criterion_id
-                for criterion in self.goal.acceptance_criteria
-                if criterion.criterion_id not in node_criteria
-            ]
-            if missing:
-                raise SpecError(
-                    "node-scoped acceptance criteria do not cover the goal: "
-                    f"{sorted(missing)} would never be verified by any node"
-                )
+        if self.plan.integrated_acceptance:
+            self._validate_integrated_plan()
+        else:
+            # Legacy plans may narrow individual gates, but must cover the original goal.
+            node_criteria = {
+                c.criterion_id for node in self.plan.nodes for c in node.acceptance_criteria
+            }
+            if node_criteria:
+                missing = sorted(c.criterion_id for c in self.goal.acceptance_criteria
+                                 if c.criterion_id not in node_criteria)
+                if missing:
+                    raise SpecError(
+                        "node-scoped acceptance criteria do not cover the goal: "
+                        f"{missing} would never be verified by any node"
+                    )
 
         # Meta-Spec may never be looser than SPEC-03: a protected path must not be
         # declared writable by the very boundary the agent controls.
@@ -819,6 +824,36 @@ class SpecBundle:
                         f"plan node {node.node_id} claims an expected artifact "
                         f"{artifact!r} that Meta-Spec protects from agent writes"
                     )
+
+    def _validate_integrated_plan(self) -> None:
+        """Local gates admit partial work; the integrated goal is mandatory at promotion."""
+        owners: set[str] = set()
+        goal_commands = {c.command for c in self.goal.acceptance_criteria if c.command}
+        criterion_ids = {c.criterion_id for c in self.goal.acceptance_criteria}
+        for node in self.plan.nodes:
+            if not node.objective.strip() or len(set(node.deps)) != len(node.deps):
+                raise SpecError(f"node {node.node_id} requires an objective and unique dependencies")
+            for path in node.expected_artifacts:
+                if (not path or any(mark in path for mark in ("*", "?"))
+                        or not self.boundary.allows_path(path) or path in owners):
+                    raise SpecError(
+                        f"node {node.node_id} must uniquely own concrete allowed artifacts: {path!r}"
+                    )
+                owners.add(path)
+            criteria = node.acceptance_criteria
+            if not any(c.kind in EXECUTABLE_KINDS for c in criteria):
+                raise SpecError(f"node {node.node_id} requires an executable local acceptance check")
+            for criterion in criteria:
+                if criterion.criterion_id in criterion_ids:
+                    raise SpecError(f"duplicate local or goal criterion ID: {criterion.criterion_id}")
+                criterion_ids.add(criterion.criterion_id)
+                if criterion.command and criterion.command in goal_commands:
+                    raise SpecError(
+                        f"node {node.node_id} repeats the integrated goal command; "
+                        "use a specific local check"
+                    )
+                if criterion.path and not self.boundary.allows_path(criterion.path):
+                    raise SpecError(f"node {node.node_id} local check path is outside the boundary")
 
     def canonical_form(self) -> dict[str, Any]:
         return {

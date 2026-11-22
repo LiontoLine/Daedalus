@@ -21,8 +21,9 @@ from dataclasses import replace
 from daedalus.errors import DaedalusError
 from daedalus.config import Settings
 from daedalus.domain.approval import ApprovalDecision
-from daedalus.application.coding_worker import FileOp, ModelWorker, ScriptedWorker
-from daedalus.application.gatekeeper.tier2 import Tier2Gate
+from daedalus.application.coding_worker import FileOp, ScriptedWorker
+from daedalus.application.worker_factory import build_model_worker
+from daedalus.application.gatekeeper.tier2 import ClientReviewer, Tier2Gate
 from daedalus.application.orchestrator import RunOrchestrator
 from daedalus.application.planner import (
     DeterministicPlanner,
@@ -32,16 +33,16 @@ from daedalus.application.planner import (
 from daedalus.application.scheduler import Quota, summarize_steps
 from daedalus.domain.spec import (
     AcceptanceCriterion,
-    PlanSpec,
+    RetryPolicy,
     AssertionKind,
     MetaSpec,
     NetworkPolicy,
     RiskLevel,
     SpecBundle,
 )
-from daedalus.infrastructure.git_sandbox import GitSandbox, init_repo, initial_commit
+from daedalus.infrastructure.git_sandbox import GitSandbox, _git, init_repo, initial_commit
 from daedalus.infrastructure.store import EventStore
-from daedalus.model.base import Message, ModelRegistry, TokenBudget
+from daedalus.model.base import TokenBudget
 from daedalus.model.mock import ScriptedModelClient
 from daedalus.model.openai_compatible import OpenAICompatibleClient
 from daedalus.security.secrets import SecretBroker
@@ -71,6 +72,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--goal-id", default="GOAL-001")
     run.add_argument("--path", action="append", required=True, help="writable path glob")
     run.add_argument("--test-command", required=True, help="the acceptance test command")
+    run.add_argument("--requirement-check-id", default="",
+                     help="bind a READY behavior qualification from the specified workspace")
+    run.add_argument("--require-behavior-paths", action="store_true",
+                     help="refuse to plan without a READY change and invariant path qualification")
     run.add_argument(
         "--workspace",
         default="",
@@ -426,6 +431,17 @@ def _open_store(workspace: str) -> EventStore:
     return EventStore(root / "daedalus.db")
 
 
+def _workspace_rag(workspace: Path, store: EventStore):
+    """Share the CLI workspace's knowledge, retrieval settings and event history."""
+    from daedalus.application.agentic_rag import AgenticRAG
+    from daedalus.infrastructure.knowledge import KnowledgeStore
+    from daedalus.infrastructure.vector_index import LocalRetrievalRuntime
+
+    knowledge = KnowledgeStore(workspace / "knowledge")
+    retrieval = LocalRetrievalRuntime(knowledge.root / ".retrieval")
+    return AgenticRAG(knowledge, store, retrieval=retrieval)
+
+
 def _resolve_run_id(store: EventStore, run_id: str) -> str:
     if run_id:
         return run_id
@@ -453,6 +469,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     repo = Path(args.repo).expanduser().resolve()
     if not (repo / ".git").exists():
         raise SystemExit(f"{repo} is not a Git repository")
+    target = _git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False)
+    target_ref = target.stdout.strip()
+    if (not target.ok or not target_ref.startswith("refs/heads/")
+            or not _git(repo, ["rev-parse", "--verify", target_ref], check=False).ok):
+        raise DaedalusError("run requires a checked-out branch with at least one commit")
+    target_branch = target_ref.removeprefix("refs/heads/")
 
     risk = RiskLevel(args.risk)
     request = PlanRequest(
@@ -464,6 +486,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         risk_level=risk,
         network_policy=NetworkPolicy.DENY,
     )
+    qualification = None
+    if args.requirement_check_id:
+        from daedalus.application.requirement_evidence import load_qualification
+
+        if not args.workspace:
+            raise DaedalusError("--requirement-check-id requires its explicit --workspace")
+        try:
+            qualification = load_qualification(
+                Path(args.workspace).expanduser(), args.requirement_check_id, repo,
+                request.objective, request.target_paths,
+            )
+        except (OSError, ValueError, KeyError, TypeError, SyntaxError):
+            raise DaedalusError("a matching READY requirement check on the current clean base is required") from None
+    if args.require_behavior_paths:
+        from daedalus.application.requirement_evidence import require_path_qualification
+
+        try:
+            require_path_qualification(qualification[0] if qualification else None)
+        except ValueError as error:
+            raise DaedalusError(str(error)) from None
+    if qualification is not None:
+        from daedalus.application.requirement_evidence import with_behavior_path_context
+
+        request = with_behavior_path_context(request, qualification)
 
     planner = DeterministicPlanner(meta=MetaSpec.default())
     tier2: Tier2Gate | None = None
@@ -472,25 +518,30 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if args.model:
         broker = SecretBroker()
-        client = OpenAICompatibleClient(
+        from daedalus.model.multi_provider import MultiProviderClient
+        client = MultiProviderClient(
             name="cli-model",
             model=args.model,
             base_url=args.base_url,
             api_key_resolver=lambda: broker.redeem(broker.request("model.api_key")),
         )
-        registry = ModelRegistry()
-        registry.register("coder", client)
-        registry.register("planner", client)
         planner = ModelPlanner(
-            client=client,
+            client=client.for_task("structured_plan"),
             fallback=DeterministicPlanner(),
             budget=budget,
         )
-        worker = ModelWorker(client=client, budget=budget)
-        if args.review or args.model:
-            tier2 = Tier2Gate(reviewer=_SameModelReviewer(client=client, budget=budget))
+        tier2 = Tier2Gate(reviewer=ClientReviewer(
+            client=client.for_task("structured_review"), budget=budget,
+        ))
 
     bundle: SpecBundle = planner.plan(request)
+    if qualification is not None:
+        from daedalus.application.requirement_evidence import bind_qualified_bundle
+
+        try:
+            bundle = bind_qualified_bundle(bundle, *qualification)
+        except (ValueError, KeyError, TypeError, SyntaxError):
+            raise DaedalusError("the plan does not match the qualified requirement") from None
 
     workspace = (
         Path(args.workspace).expanduser()
@@ -498,6 +549,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         else Path(tempfile.mkdtemp(prefix="daedalus-run-"))
     )
     store = _open_store(str(workspace))
+    if args.model:
+        worker = build_model_worker(
+            client.for_task("structured_edit"), budget=budget, repo_path=str(repo),
+            rag=_workspace_rag(workspace, store), reference_client=client,
+        )
 
     if worker is None:
         # Without a model there is no coding worker, so the run rehearses planning and
@@ -510,6 +566,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         orchestrator = RunOrchestrator(
             store=store,
             repo_path=repo,
+            target_branch=target_branch,
             run_root=workspace / "worktrees",
             bundle=bundle,
             worker=_NoOpWorker(),
@@ -517,43 +574,19 @@ def cmd_run(args: argparse.Namespace) -> int:
             identity=_identity_for(store, args),
         )
     else:
-        from daedalus.domain.spec import PlanNode, RetryPolicy
-
-        bundle = SpecBundle(
-            goal=bundle.goal,
-            plan=PlanSpec(
-                plan_id=bundle.plan.plan_id,
-                goal_id=bundle.plan.goal_id,
-                nodes=tuple(
-                    PlanNode(
-                        node_id=node.node_id,
-                        objective=node.objective,
-                        deps=node.deps,
-                        expected_artifacts=node.expected_artifacts,
-                        allowed_tools=node.allowed_tools,
-                        retry_policy=RetryPolicy(
-                            max_attempts=min(
-                                node.retry_policy.max_attempts, args.max_attempts
-                            ),
-                            backoff_sec=node.retry_policy.backoff_sec,
-                            backoff_factor=node.retry_policy.backoff_factor,
-                        ),
-                        timeout_sec=node.timeout_sec,
-                        intent=node.intent,
-                        revision_of=node.revision_of,
-                        extra=node.extra,
-                    )
-                    for node in bundle.plan.nodes
-                ),
-            ),
-            boundary=bundle.boundary,
-            meta=bundle.meta,
-            owner_id=bundle.owner_id,
-        )
+        bundle = replace(bundle, plan=replace(bundle.plan, nodes=tuple(
+            replace(node, retry_policy=RetryPolicy(
+                max_attempts=min(node.retry_policy.max_attempts, args.max_attempts),
+                backoff_sec=node.retry_policy.backoff_sec,
+                backoff_factor=node.retry_policy.backoff_factor,
+            ))
+            for node in bundle.plan.nodes
+        )))
         bundle.validate()
         orchestrator = RunOrchestrator(
             store=store,
             repo_path=repo,
+            target_branch=target_branch,
             run_root=workspace / "worktrees",
             bundle=bundle,
             worker=worker,
@@ -583,31 +616,50 @@ def cmd_run(args: argparse.Namespace) -> int:
             "plan-only: the spec is frozen in the registry and no run was created. "
             "Re-run with --model to execute it."
         )
-        print(json.dumps(bundle.to_dict(), indent=2, sort_keys=True)[:4000])
+        if qualification is not None:
+            from daedalus.application.requirement_evidence import preview_qualified_bundle
+
+            document = preview_qualified_bundle(bundle)
+        else:
+            document = bundle.to_dict()
+        print(json.dumps(document, indent=2, sort_keys=True))
         store.close()
         return 0
 
-    result = orchestrator.run()
-    print(json.dumps(result.describe(), indent=2, sort_keys=True))
+    from daedalus.infrastructure.repository_lock import repository_lock
+
+    with repository_lock(repo):
+        current = _git(repo, ["symbolic-ref", "--quiet", "HEAD"], check=False)
+        if not current.ok or current.stdout.strip() != target_ref:
+            raise DaedalusError("the checked-out branch changed during planning; start a new run")
+        if qualification is not None:
+            from daedalus.application.requirement_evidence import assert_qualification_base
+
+            try:
+                assert_qualification_base(repo, qualification[1])
+            except (ValueError, OSError):
+                raise DaedalusError("the qualified baseline changed during planning") from None
+        orchestrator.create_run(base_ref=qualification[1]["base_commit"] if qualification else target_ref)
+        result = orchestrator.run()
+    description = result.describe()
+    description["promoted_commit"] = result.promoted_commit
+    nodes = {node.node_id: node for node in bundle.plan.nodes}
+    description["plan"] = {
+        "integrated_acceptance": bundle.plan.integrated_acceptance,
+        "planner": (
+            "deterministic_fallback" if getattr(planner, "used_fallback", False) else planner.name
+        ),
+        "nodes": [
+            {"node_id": node.node_id, "objective": node.objective, "deps": list(node.deps),
+             "expected_artifacts": list(node.expected_artifacts),
+             "criteria": [c.criterion_id for c in (
+                 node.acceptance_criteria or bundle.goal.acceptance_criteria)]}
+            for node in (nodes[node_id] for node_id in bundle.plan.topo_order())
+        ],
+    }
+    print(json.dumps(description, indent=2, sort_keys=True))
     store.close()
     return 0 if result.status == "COMPLETED" else 2
-
-
-class _SameModelReviewer:
-    """Tier-2 reviewer backed by the same endpoint, with its own budget accounting."""
-
-    def __init__(self, *, client: OpenAICompatibleClient, budget: TokenBudget) -> None:
-        self.client = client
-        self.budget = budget
-
-    def complete(self, prompt: str, *, subject_digest: str) -> str:
-        completion = self.client.complete(
-            [Message(role="user", content=prompt)],
-            temperature=0.0,
-            response_format_json=True,
-        )
-        self.budget.record(completion)
-        return completion.text
 
 
 class _NoOpWorker:
@@ -1287,7 +1339,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 base_url=args.base_url,
                 api_key_resolver=lambda: broker.redeem(broker.request("model.api_key")),
             )
-            worker = ModelWorker(client=client, budget=TokenBudget(max_tokens_per_run=200_000))
+            worker = build_model_worker(
+                client, budget=TokenBudget(max_tokens_per_run=200_000),
+                repo_path=str(repo_path),
+                rag=_workspace_rag(Path(args.workspace).expanduser(), store),
+                reference_client=client,
+            )
 
         orchestrator = RunOrchestrator(
             store=store,
@@ -1532,7 +1589,8 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             "The control plane's guarantees do not depend on these gaps, but a security "
             "assessment must account for them. See docs/runbook.md section 6."
         )
-    return 0 if not [g for g in report.gaps if "no process isolation" in g] else 1
+    selected = next((driver for driver in report.drivers if driver.driver == report.selected), None)
+    return 0 if selected and selected.available and selected.process_isolation.enforced else 1
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

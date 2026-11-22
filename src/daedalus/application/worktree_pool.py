@@ -25,7 +25,7 @@ from pathlib import Path
 
 from daedalus.domain.ids import stable_id
 from daedalus.errors import DaedalusError
-from daedalus.infrastructure.git_sandbox import GitSandbox, _git  # noqa: PLC2701 - same package
+from daedalus.infrastructure.git_sandbox import GitSandbox, _git, fast_forward_branch  # noqa: PLC2701 - same package
 
 
 class PoolExhausted(DaedalusError):
@@ -171,25 +171,7 @@ class WorktreePool:
         head = self.integration_head()
         if expected_commit and head != expected_commit:
             raise DaedalusError("integrated head changed after final goal approval; promotion refused")
-        current = _git(
-            self.repo_path, ["rev-parse", f"refs/heads/{self.target_branch}"], check=True
-        ).stdout.strip()
-        if current == head:
-            return current
-        if not _is_ancestor(self.repo_path, current, head):
-            raise DaedalusError(
-                f"run branch {self.run_branch} diverged from {self.target_branch}; "
-                "refusing an automatic promotion",
-                target=self.target_branch,
-                target_commit=current,
-                run_commit=head,
-            )
-        _git(
-            self.repo_path,
-            ["update-ref", f"refs/heads/{self.target_branch}", head, current],
-            check=True,
-        )
-        return head
+        return fast_forward_branch(self.repo_path, self.target_branch, head)
 
     def describe(self) -> dict[str, object]:
         return {

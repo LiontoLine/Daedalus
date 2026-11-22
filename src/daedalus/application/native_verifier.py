@@ -7,6 +7,9 @@ import json
 import re
 import textwrap
 
+from daedalus.infrastructure.git_sandbox import CommandResult
+from daedalus.infrastructure.redact import redact_text
+
 RECEIPT_PREFIX = "DAEDALUS_NATIVE_RESULT "
 
 
@@ -191,11 +194,17 @@ def runner_result(value, returncode):
 def render_native_verifier(
     command, project, *, expected_tests=None, followup=None, immutable_files=()
 ) -> str:
-    """Embed only our stdlib supervisor; the model cannot edit its frozen file."""
+    """Embed the supervisor for execution from the selected checkout root."""
+    arguments = list(command)
+    # -B is an interpreter option, not the script path observed by native_child.
+    python_options = arguments[1:2] if arguments[1:2] == ["-B"] else []
+    if python_options:
+        del arguments[1]
     return (
         "import os, sys\n"
-        "root=os.path.dirname(os.path.abspath(__file__))\n"
-        "sys.path[:]=[p for p in sys.path if p and os.path.abspath(p)!=root]\n"
+        "root=os.getcwd()\n"
+        "launcher=os.path.dirname(os.path.abspath(__file__))\n"
+        "sys.path[:]=[p for p in sys.path if p and os.path.abspath(p) not in {root,launcher}]\n"
         "import hashlib, json, subprocess, tempfile\n"
         + textwrap.dedent(inspect.getsource(runner_result))
         + "\n"
@@ -210,10 +219,10 @@ def render_native_verifier(
         "before={path:digest(path) for path in immutable_files}\n"
         f"child_source={textwrap.dedent(inspect.getsource(native_child))!r}\n"
         "with tempfile.TemporaryFile() as channel:\n"
-        f"    arguments={command!r}\n    project={project!r}\n"
+        f"    arguments={arguments!r}\n    project={project!r}\n"
         "    script=child_source+'\\nnative_child('+repr(arguments)+','+repr(project) "
         "+','+str(channel.fileno())+')\\n'\n"
-        "    process=subprocess.run([arguments[0],'-c',script],cwd=root,env=env,"
+        f"    process=subprocess.run([arguments[0],*{python_options!r},'-c',script],cwd=root,env=env,"
         "pass_fds=(channel.fileno(),),capture_output=True,text=True)\n"
         "    channel.seek(0)\n"
         "    try: value=json.loads(channel.read(65536))\n"
@@ -255,3 +264,15 @@ def read_native_receipt(output: str) -> dict:
     if not isinstance(value, dict) or value.get("version") != 1:
         raise ValueError("native supervisor receipt is invalid")
     return value
+
+
+def evaluate_check(command: str, result: CommandResult, *, require_native_receipt: bool) -> dict:
+    """Report a command under its frozen exit-code or native-receipt contract."""
+    output = result.combined(24000)
+    receipt = read_native_receipt(output) if require_native_receipt else None
+    return {
+        "command": command,
+        "passed": result.ok and (receipt is None or receipt["passed"]),
+        "receipt": receipt,
+        "output": redact_text(output),
+    }

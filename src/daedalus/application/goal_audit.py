@@ -18,6 +18,7 @@ from daedalus.application.gatekeeper.tier2 import (
     SemanticReviewRequest,
     Tier2Gate,
 )
+from daedalus.application.repair_evidence import normalize_semantic_criterion
 from daedalus.application.review_context import dependency_context
 from daedalus.domain.canonical import digest_of
 from daedalus.domain.ids import new_id
@@ -136,6 +137,17 @@ def audit_delivery(owner: Any, pool: Any, stage: int) -> dict[str, Any]:
         reviewer = owner.tier2.reviewer
         if hasattr(reviewer, "budget"):
             reviewer.budget = owner.budget
+        from daedalus.application.requirement_evidence import model_behavior_evidence
+
+        review_summary = check.to_payload()
+        review_summary["evidence"] = {
+            **check.evidence,
+            "criteria": [
+                {**row, "behavior_evidence": model_behavior_evidence(row["behavior_evidence"])}
+                if row.get("behavior_evidence") else row
+                for row in result["criteria"]
+            ],
+        }
         request = GoalReviewRequest(
             step_id=f"goal:{owner.run_id}:{stage}",
             execution_id=owner.execution_id,
@@ -149,7 +161,7 @@ def audit_delivery(owner: Any, pool: Any, stage: int) -> dict[str, Any]:
             ),
             changed_files=tuple(files),
             patch=patch,
-            tier1_summary=json.dumps(check.to_payload(), ensure_ascii=False),
+            tier1_summary=json.dumps(review_summary, ensure_ascii=False),
             risk_level=owner.bundle.goal.risk_level.value,
             reference_context=dependency_context(
                 box, tuple(files), query=owner.bundle.goal.objective + "\n" + patch
@@ -188,6 +200,7 @@ def audit_delivery(owner: Any, pool: Any, stage: int) -> dict[str, Any]:
         if not valid:
             result["reasons"] = ["goal reviewer omitted or malformed per-criterion evidence"]
             return result
+        rows = [normalize_semantic_criterion(row) for row in rows]
         from daedalus.application.requirement_evidence import valid_behavior_references
         if not valid_behavior_references(result["criteria"], rows):
             result["reasons"] = [
@@ -209,6 +222,24 @@ def audit_delivery(owner: Any, pool: Any, stage: int) -> dict[str, Any]:
         return result
     finally:
         box.remove()
+
+
+def settled_goal_approval(
+    store, run_id: str, execution_id: str, spec_digest: str, commit: str,
+) -> bool:
+    """Match a recorded, settled final verdict before any new execution is attempted."""
+    events = [e for e in store.events_for(f"goal:{run_id}")
+              if e.event_type != "GoalTrunkSnapshot"]
+    if not events or not commit or store.events_for(f"delivery:{run_id}"):
+        return False
+    last = events[-1]
+    row = last.payload
+    return (
+        last.execution_id == execution_id and last.event_type == "GoalAuditCompleted"
+        and row.get("decision") == "APPROVE"
+        and row.get("scope") in {"acceptance_only", "goal_and_acceptance"}
+        and row.get("spec_digest") == spec_digest and row.get("commit") == commit
+    )
 
 
 def goal_audit_view(store: Any, run_id: str) -> dict[str, Any]:

@@ -1,39 +1,45 @@
-<section class="panel panel-lead" id="intake-step-task">
-  <header class="panel-head">
-    <div>
-      <h2>从一个目标开始</h2>
-      <p class="panel-sub">描述目标、选择仓库。确认需求后，下方会生成执行计划。</p>
-    </div>
-  </header>
-
-  <div id="intake-error" class="alert" hidden></div>
-
-  <div class="intake-task">
+<section class="chat-composer" id="intake-step-task" aria-label="发起任务">
+  <form class="intake-task" id="intake-composer">
     <label class="intake-objective">
-      <span class="intake-label">任务</span>
-      <textarea id="intake-objective" rows="3"
-        placeholder="例：把 summarize() 的字数统计改成按空白切分，并保留空输入返回 0"></textarea>
+      <span class="sr-only">任务消息</span>
+      <textarea id="intake-objective" rows="3" required aria-describedby="chat-send-hint"
+        placeholder="描述想做的改动，以及需要保留的行为…"></textarea>
     </label>
 
-    <div class="prompt-examples" aria-label="目标示例"><span class="muted">试着从这里开始</span><button type="button" class="ghost small" data-objective="修复一个已知问题，并添加覆盖边界情况的回归测试。">修复问题</button><button type="button" class="ghost small" data-objective="为现有功能补充单元测试，覆盖正常输入、空输入和异常情况。">补充测试</button><button type="button" class="ghost small" data-objective="梳理项目的安装与启动步骤，完善 README，并验证示例命令。">完善文档</button></div>
-    <div class="intake-repo">
-      <span class="intake-label">仓库</span>
+    <details class="disclose chat-repository" id="chat-repository">
+      <summary id="chat-repo-label">选择 Git 仓库</summary>
       <div id="intake-repos" class="repo-cards"></div>
-      <button type="button" class="ghost small" id="intake-other-repo">其他路径…</button>
+      <button type="button" class="ghost small" id="intake-other-repo">输入仓库路径</button>
+      <label class="sr-only" for="intake-repo-path">Git 仓库绝对路径</label>
       <input id="intake-repo-path" class="hidden" placeholder="/absolute/path/to/repo" />
-    </div>
+    </details>
 
-    <div class="intake-model-connection"><span id="workflow-model-label">尚未读取模型连接</span><button type="button" class="ghost small" data-model-open>导入 / 设置模型</button></div>
-    <div class="intake-go">
-      <button type="button" id="intake-start" class="primary">分析任务 →</button>
-      <span class="muted" id="intake-model-note"></span>
+    <details class="disclose">
+      <summary>绑定已预检的行为验收（可选）</summary>
+      <label class="intake-objective">
+        <span class="intake-label">行为验收编号</span>
+        <input id="intake-requirement-check-id" maxlength="128"
+               autocomplete="off" placeholder="requirement_…" />
+      </label>
+      <label><input type="checkbox" id="intake-require-behavior-paths" />
+        必须验收完整用户路径（入口 → 状态变化 → 可观察结果）</label>
+      <p class="muted">需为相同仓库、目标、写入范围和当前提交的 READY 收据。
+        要求完整路径时，收据须同时覆盖变更和必须保留的行为。
+        执行只向模型提供公开路径与汇总结果，不发送验收代码或输入。</p>
+    </details>
+
+    <div class="chat-send-row">
+      <div class="chat-model"><button type="button" class="ghost small" data-model-open>模型设置</button><span id="workflow-model-label" class="muted">尚未读取模型连接</span></div>
+      <button type="submit" id="intake-start" class="primary">发送 <span aria-hidden="true">↑</span></button>
     </div>
-  </div>
+    <span id="chat-send-hint" class="muted chat-key-hint">Enter 发送 · Shift+Enter 换行</span>
+  </form>
 </section>
 
-<section class="panel" id="intake-step-questions" hidden>
+<section class="panel chat-question" id="intake-step-questions" aria-label="需求澄清" hidden>
   <header class="panel-head">
     <div>
+      <span class="chat-author">Daedalus</span>
       <h2 id="intake-question-title">模型的问题</h2>
       <p class="panel-sub" id="intake-question-sub"></p>
     </div>
@@ -56,16 +62,4 @@
   </details>
 
   <div id="intake-rejections" class="intake-note" hidden></div>
-</section>
-
-
-
-<section class="panel" id="intake-step-recent" hidden>
-  <header class="panel-head">
-    <div>
-      <h2>最近的任务</h2>
-      <p class="panel-sub">继续未完成的需求确认，或打开已经创建的任务。</p>
-    </div>
-  </header>
-  <div id="intake-recent"></div>
 </section>

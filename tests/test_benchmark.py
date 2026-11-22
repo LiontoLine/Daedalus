@@ -8,6 +8,7 @@ import pytest
 from daedalus.application.benchmark import MeteredClient, run_comparison, write_report
 from daedalus.application.benchmark_cases import MODEL_CASES
 from daedalus.model.base import Completion, Message, ModelError
+from daedalus.errors import ModelBudgetExceeded
 
 
 def test_failed_completion_usage_still_consumes_comparison_budget():
@@ -23,7 +24,7 @@ def test_failed_completion_usage_still_consumes_comparison_budget():
     with pytest.raises(ModelResponseIncomplete):
         client.complete([Message("user", "task")])
     assert client.total == 100 and client.records[0]["usage_available"]
-    with pytest.raises(ModelError, match="budget exhausted"):
+    with pytest.raises(ModelBudgetExceeded):
         client.complete([Message("user", "task")])
     assert len(client.records) == 1
 
@@ -137,7 +138,7 @@ def test_failed_calls_count_toward_budget_and_output_budget_is_capped():
     with pytest.raises(ModelError):
         client.complete(messages, max_tokens=500)
     client.complete(messages, max_tokens=500)
-    with pytest.raises(ModelError, match="exhausted"):
+    with pytest.raises(ModelBudgetExceeded):
         client.complete(messages)
     assert len(client.records) == 2 and fake.limits == [99, 99]
     assert client.total == 5
@@ -159,3 +160,69 @@ def test_invalid_protocol_does_not_create_experiment(tmp_path, kwargs):
     with pytest.raises(ValueError):
         run_comparison(destination, **kwargs)
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("phase", ["single", "heldout"])
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_experiment_candidate_execution_never_bypasses_selected_driver(
+    tmp_path, monkeypatch, phase, unavailable,
+):
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from daedalus.application import benchmark
+    from daedalus.application.benchmark_cases import CONTROLLED_CASES
+    from daedalus.infrastructure.sandbox import CommandOutcome, IsolationUnavailable
+
+    marker = tmp_path / "unisolated-execution"
+    untrusted = f"from pathlib import Path\nPath({str(marker)!r}).write_text('ran')\n"
+    case = replace(CONTROLLED_CASES[0], public=untrusted, heldout=untrusted)
+    root = tmp_path / "trial"
+    root.mkdir()
+    repo, bundle, _ = benchmark._setup(case, root, 30000)
+    commands = []
+
+    def deny(**options):
+        commands.append(options["command"])
+        return CommandOutcome(
+            " ".join(options["command"]), 1, "", "isolated execution denied", 0,
+            driver="selected-isolated-driver",
+        )
+
+    choice = SimpleNamespace(
+        driver=SimpleNamespace(run=deny),
+        describe=lambda: {"selected": "selected-isolated-driver"},
+    )
+
+    def select(boundary, *, requested):
+        assert requested == "auto"
+        if unavailable:
+            raise IsolationUnavailable("selected driver is unavailable")
+        return choice
+
+    monkeypatch.setattr(
+        benchmark.DriverRegistry, "default",
+        lambda: SimpleNamespace(select=select),
+    )
+
+    def execute():
+        if phase == "single":
+            return benchmark._single_loop(
+                repo, bundle, benchmark.CandidateWorker(case), root, 30000, attempts=1,
+            )
+        commit = benchmark._git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
+        return benchmark._evaluate(repo, bundle, case, root, commit)
+
+    if unavailable:
+        with pytest.raises(IsolationUnavailable):
+            execute()
+        assert not commands
+    else:
+        outcome = execute()
+        if phase == "single":
+            assert not outcome["delivered"]
+            assert commands == [["python3", "verify_public.py"]]
+        else:
+            assert not outcome["public_passed"] and not outcome["heldout_passed"]
+            assert commands == [["python3", "verify_public.py"], ["python3", "heldout.py"]]
+    assert not marker.exists()

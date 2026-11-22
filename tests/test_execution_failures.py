@@ -11,6 +11,7 @@ from daedalus.application.benchmark import CountedWorker, _daedalus
 from daedalus.application.coding_worker import FileOp, ModelWorker, ScriptedWorker
 from daedalus.application.inspection import RepositoryInspector, safe_receipts
 from daedalus.application.native_verifier import (
+    evaluate_check,
     native_result,
     read_native_receipt,
     render_native_verifier,
@@ -118,6 +119,30 @@ def test_stale_edit_feedback_supplies_relevant_current_symbol_without_applying_b
     assert box.read_file(TARGET) == source
     assert "return value + 3" in result.execution_log and "needed" in result.execution_log
     assert len(result.execution_log) < 2600
+
+
+def test_original_task_evaluation_distinguishes_exit_code_and_native_receipt_contracts(box):
+    import shlex
+
+    from daedalus.infrastructure.sandbox import DriverRegistry
+    from tests.conftest import CORRECT_IMPLEMENTATION
+    from tests.test_worker_checks import python_command
+
+    box.write_file(TARGET, CORRECT_IMPLEMENTATION)
+    context = context_for(box)
+    driver = DriverRegistry.default().select(context.bundle.boundary).driver
+    command = python_command(
+        "import sys; sys.path.insert(0, 'src'); "
+        "from example_project.textstats import average_word_length; "
+        "assert average_word_length('aa bbbb') == 3.0; "
+        "assert average_word_length('') == 0.0"
+    )
+    checked = driver.run(worktree=box.worktree_path, command=shlex.split(command),
+                         timeout_sec=30, boundary=context.bundle.boundary)
+    public = evaluate_check("verify_public.py", checked, require_native_receipt=False)
+    original = evaluate_check("verify_original_issue.py", checked, require_native_receipt=True)
+    assert public["passed"] and not original["passed"]
+    assert not original["receipt"]["complete"]
 
 
 def workload(tmp_path, monkeypatch):
@@ -326,3 +351,29 @@ def test_frozen_supervisor_enforces_selection_and_additional_issue_check(
     receipt = read_native_receipt(run.stdout + run.stderr)
     assert run.returncode != 0 and not receipt["passed"] and receipt["complete"]
     assert receipt["reason"] == reason and receipt["executed"] == 1
+
+
+@pytest.mark.parametrize("nested_launcher", [False, True])
+def test_frozen_supervisor_executes_script_after_python_bytecode_flag(tmp_path, nested_launcher):
+    import subprocess
+
+    (tmp_path / "native_tests.py").write_text(
+        "import unittest\n"
+        "class Checks(unittest.TestCase):\n"
+        "    def test_selected(self): self.assertEqual(3 * 7, 21)\n"
+        "    def test_not_selected(self): self.fail('selection widened')\n"
+        "if __name__ == '__main__': unittest.main()\n"
+    )
+    launcher = tmp_path / "launcher" if nested_launcher else tmp_path
+    launcher.mkdir(exist_ok=True)
+    supervisor = launcher / "verify.py"
+    supervisor.write_text(render_native_verifier(
+        [sys.executable, "-B", "native_tests.py", "Checks.test_selected"],
+        "django/django", expected_tests=1,
+    ))
+    run = subprocess.run(
+        [sys.executable, str(supervisor)], cwd=tmp_path, capture_output=True, text=True,
+    )
+    receipt = read_native_receipt(run.stdout + run.stderr)
+    assert run.returncode == 0 and receipt["complete"] and receipt["passed"]
+    assert receipt["executed"] == 1

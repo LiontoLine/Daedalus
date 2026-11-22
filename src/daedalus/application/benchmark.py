@@ -26,19 +26,21 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from daedalus.application.benchmark_cases import CONTROLLED_CASES, MODEL_CASES, BenchmarkCase
-from daedalus.application.coding_worker import FileOp, ModelWorker, ScriptedWorker
+from daedalus.application.coding_worker import FileOp, ScriptedWorker
+from daedalus.application.worker_factory import build_model_worker
 from daedalus.application.gatekeeper.tier2 import ClientReviewer, Tier2Gate
 from daedalus.application.identity import OwnerRegistry
-from daedalus.application.inspection import RepositoryInspector
 from daedalus.application.orchestrator import NON_RETRYABLE_ERRORS, RunOrchestrator
 from daedalus.application.planner import DeterministicPlanner, PlanRequest
 from daedalus.application.scheduler import Quota
 from daedalus.application.worker import WorkerContext
 from daedalus.domain.spec import AcceptanceCriterion, AssertionKind
+from daedalus.errors import ModelBudgetExceeded
 from daedalus.infrastructure.git_sandbox import GitSandbox, _git, init_repo, initial_commit
 from daedalus.infrastructure.knowledge import atomic_json
 from daedalus.infrastructure.process import run_command
 from daedalus.infrastructure.redact import redact, redact_text
+from daedalus.infrastructure.sandbox import DriverRegistry
 from daedalus.infrastructure.store import EventStore
 from daedalus.model.base import Completion, ModelError, TokenBudget, token_usage_details
 from daedalus.model.openai_compatible import OpenAICompatibleClient
@@ -137,11 +139,11 @@ class MeteredClient:
 
     def complete(self, messages, **kwargs):
         if len(self.records) >= self.max_calls or self.total >= self.max_tokens:
-            raise ModelError("experiment arm budget exhausted", request_not_dispatched=True)
+            raise ModelBudgetExceeded("experiment arm budget exhausted", request_not_dispatched=True)
         estimate = sum(len(message.content) for message in messages) // 3
         remaining = self.max_tokens - self.total - estimate
         if remaining <= 0:
-            raise ModelError("experiment arm has no estimated token budget remaining", request_not_dispatched=True)
+            raise ModelBudgetExceeded("experiment arm has no estimated token budget remaining", request_not_dispatched=True)
         kwargs["max_tokens"] = min(int(kwargs.get("max_tokens", 4096)), remaining)
         started = time.monotonic()
         entry = {"index": len(self.records) + 1, "ok": False, "request_dispatched": True,
@@ -241,6 +243,10 @@ class CountedWorker:
     def budget(self, value):
         self.inner.budget = value
 
+    @property
+    def capabilities(self):
+        return getattr(self.inner, "capabilities", {})
+
     def implement(self, box, context):
         self.calls += 1
         result = self.inner.implement(box, context)
@@ -302,6 +308,9 @@ def _setup(case: BenchmarkCase, root: Path, max_tokens):
 
 def _single_loop(repo, bundle, worker, root, max_tokens, *, attempts=3):
     """Same FS boundary, tests, three repair attempts and atomic final promotion."""
+    isolation = DriverRegistry.default().select(
+        bundle.boundary, requested=bundle.boundary.isolation,
+    )
     box = GitSandbox.create(
         repo_path=repo, run_root=root / "worktrees", name="single-loop", base_ref="main"
     )
@@ -337,14 +346,10 @@ def _single_loop(repo, bundle, worker, root, max_tokens, *, attempts=3):
                 if result.error in NON_RETRYABLE_ERRORS:
                     break
                 continue
-            if bundle.boundary.isolation == "seatbelt":
-                from daedalus.infrastructure.sandbox import SeatbeltDriver
-                tests = SeatbeltDriver().run(
-                    worktree=box.worktree_path, command=["python3", "verify_public.py"],
-                    timeout_sec=120, boundary=bundle.boundary,
-                )
-            else:
-                tests = box.run(["python3", "verify_public.py"], timeout_sec=30)
+            tests = isolation.driver.run(
+                worktree=box.worktree_path, command=["python3", "verify_public.py"],
+                timeout_sec=120, boundary=bundle.boundary,
+            )
             history.append(
                 {
                     "attempt": attempt,
@@ -374,6 +379,7 @@ def _single_loop(repo, bundle, worker, root, max_tokens, *, attempts=3):
             "manual_interventions": 0,
             "requires_manual_review": not delivered,
             "trace": "single-loop.json",
+            "isolation": isolation.describe(),
             "inspections": sum(len(row.get("inspections", [])) for row in history),
             "test_failures": sum(row.get("public_test_passed") is False for row in history),
         }
@@ -383,7 +389,9 @@ def _single_loop(repo, bundle, worker, root, max_tokens, *, attempts=3):
 
 def _daedalus(repo, bundle, worker, client, root, max_tokens):
     with EventStore(root / "events.db") as store:
-        reviewer = Tier2Gate(ClientReviewer(client)) if client else None
+        reviewer = Tier2Gate(
+            ClientReviewer(client, budget=getattr(worker, "budget", None))
+        ) if client else None
         owner = RunOrchestrator(
             store=store,
             identity=OwnerRegistry(store),
@@ -396,6 +404,9 @@ def _daedalus(repo, bundle, worker, client, root, max_tokens):
             goal_audit_enabled=True,
             retry_backoff_sec=0,
         )
+        if reviewer is not None:
+            # Adoption tightens this authoritative object to the worker's limits.
+            reviewer.reviewer.budget = owner.budget
         owner.register_spec()
         result = owner.run()
         run = store.get_run(owner.run_id)
@@ -416,6 +427,7 @@ def _daedalus(repo, bundle, worker, client, root, max_tokens):
             "manual_interventions": 0,
             "requires_manual_review": result.status == "AWAITING_APPROVAL",
             "trace": "daedalus-events.json",
+            "isolation": owner.isolation.describe(),
             "event_sequence_errors": len(store.verify_sequences()),
             "inspections": sum(len(json.loads(row["document"]).get("extra", {}).get("inspection_receipts", []))
                 for step in store.list_steps(owner.run_id) for row in store.artifacts_for_step(step["step_id"])),
@@ -452,13 +464,22 @@ def _independent_import_violations(repo, commit):
 
 def _evaluate(repo, bundle, case, root, commit):
     # This worktree and its held-out checks did not exist during model calls.
+    isolation = DriverRegistry.default().select(
+        bundle.boundary, requested=bundle.boundary.isolation,
+    )
     box = GitSandbox.create_from(
         repo_path=repo, run_root=root / "evaluation", name="heldout", base_commit=commit
     )
     try:
-        public = box.run(["python3", "verify_public.py"], timeout_sec=30)
+        public = isolation.driver.run(
+            worktree=box.worktree_path, command=["python3", "verify_public.py"],
+            timeout_sec=30, boundary=bundle.boundary,
+        )
         box.write_file("heldout.py", case.heldout)
-        result = box.run(["python3", "heldout.py"], timeout_sec=30)
+        result = isolation.driver.run(
+            worktree=box.worktree_path, command=["python3", "heldout.py"],
+            timeout_sec=30, boundary=bundle.boundary,
+        )
         # Independent oracle: these tasks explicitly forbid adding third-party
         # dependencies. Do not use the gate under evaluation as its own grader.
         dependency_files = [
@@ -485,6 +506,7 @@ def _evaluate(repo, bundle, case, root, commit):
             "policy_error": policy_reason,
             "changed_files": changed,
             "evaluation_output": result.combined(2000),
+            "evaluation_isolation": isolation.describe(),
         }
     finally:
         box.remove()
@@ -524,8 +546,18 @@ def run_comparison(
         raise ValueError("comparison destination must be empty")
     destination.mkdir(parents=True, exist_ok=True)
     selected = cases or (CONTROLLED_CASES if mode == "controlled" else MODEL_CASES)
+
+    def model_worker(client, arm, *, budget=None):
+        worker = build_model_worker(
+            client, budget=budget,
+            enable_inspection=arm != "model",
+            enable_checks=arm != "model",
+        )
+        worker.enable_continuations = arm != "model"
+        return worker
+
     protocol = {
-        "version": 1,
+        "version": 2,
         "mode": mode,
         "transport": transport if mode == "model" else None,
         "client_source": "existing_service_profile" if client_factory else "explicit_transport",
@@ -545,7 +577,17 @@ def run_comparison(
         "elapsed_scope": "execution, tool/control overhead and held-out evaluation; excludes common repository setup",
         "baseline": "single-agent edit/test/repair loop, common FS guard and atomic publish; no additional Daedalus gates/reviewer",
         "one_shot_baseline": "one edit completion with the same contract and editable-file context; no followup observations or repair",
-        "context_policy": "contract and editable-file contents for all arms; committed read-only inspections available equally to classic agent and Daedalus; oracle scripts remain outside model-visible Git trees",
+        "context_policy": "contract and editable-file contents for all arms; matched committed-source inspection and frozen-criterion checks for single and Daedalus; one-shot model has no observation/check/edit continuations; no RAG/history for experimental arms; oracle scripts remain outside model-visible Git trees",
+        "worker_policy": {
+            arm: {
+                "name": "fixed-candidate-control" if mode == "controlled" else
+                        "one-shot-no-continuations" if arm == "model" else
+                        "shared-runtime-no-rag",
+                "capabilities": model_worker(None, arm).capabilities if mode == "model" else
+                                {"model": False, "fixed_candidate": True},
+            }
+            for arm in arms
+        },
         "shared_constraints": [
             "standard library only",
             "no third-party dependency additions",
@@ -564,6 +606,7 @@ def run_comparison(
                 "application/dependencies.py",
                 "application/orchestrator.py",
                 "application/coding_worker.py",
+                "application/worker_factory.py", "application/worker_checks.py",
                 "application/gatekeeper/tier1.py",
                 "application/gatekeeper/tier2.py",
                 "infrastructure/git_sandbox.py",
@@ -628,13 +671,12 @@ def run_comparison(
                     )
                     client = MeteredClient(inner, max_calls, max_tokens)
                     worker = CountedWorker(
-                        ModelWorker(
-                            client,
+                        model_worker(
+                            client, arm,
                             budget=TokenBudget(
                                 max_tokens_per_run=max_tokens,
                                 max_tokens_per_step=bundle.boundary.max_tokens_per_step,
                             ),
-                            inspection_context=RepositoryInspector() if arm != "model" else None,
                         )
                     )
                 started = time.monotonic()

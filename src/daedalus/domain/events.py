@@ -73,6 +73,7 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "RepairBranchStarted",
         "RepairBranchRejected",
         "RepairBranchPromoted",
+        "WorkerEngineeringObserved",
         # audit side-channel
         "AuditNote",
         # intake lifecycle. The intake happens *before* any run exists, so these are recorded

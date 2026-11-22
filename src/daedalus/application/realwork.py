@@ -21,7 +21,7 @@ import time
 from daedalus.application.benchmark import (
     CountedWorker, MeteredClient, _daedalus, _single_loop, write_report,
 )
-from daedalus.application.coding_worker import ModelWorker
+from daedalus.application.worker_factory import build_model_worker
 from daedalus.application.inspection import RepositoryInspector
 from daedalus.application.planner import DeterministicPlanner, PlanRequest
 from daedalus.domain.spec import AcceptanceCriterion, AssertionKind
@@ -29,6 +29,7 @@ from daedalus.errors import ModelError
 from daedalus.infrastructure.git_sandbox import GitSandbox, _git, initial_commit, init_repo
 from daedalus.infrastructure.knowledge import atomic_json
 from daedalus.infrastructure.redact import redact, redact_text
+from daedalus.infrastructure.sandbox import DriverRegistry
 from daedalus.model.base import TokenBudget
 
 PROJECT = Path(__file__).resolve().parents[3]
@@ -137,15 +138,17 @@ def _setup(row, root, max_tokens):
 
 
 def _evaluate(repo, bundle, task, root, commit):
+    isolation = DriverRegistry.default().select(
+        bundle.boundary, requested=bundle.boundary.isolation,
+    )
     box = GitSandbox.create_from(repo_path=repo, run_root=root / "evaluation",
                                  name="heldout", base_commit=commit)
     try:
         def native_check(filename):
-            if bundle.boundary.isolation == "seatbelt":
-                from daedalus.infrastructure.sandbox import SeatbeltDriver
-                return SeatbeltDriver().run(worktree=box.worktree_path,
-                    command=["python3",filename],timeout_sec=120,boundary=bundle.boundary)
-            return box.run(["python3",filename],timeout_sec=120)
+            return isolation.driver.run(
+                worktree=box.worktree_path, command=["python3", filename],
+                timeout_sec=120, boundary=bundle.boundary,
+            )
         public = native_check("verify_public.py")
         applied = subprocess.run(["git", "apply", "--check", "-"], input=task["test_patch"],
                                  text=True, cwd=box.worktree_path, capture_output=True)
@@ -161,7 +164,8 @@ def _evaluate(repo, bundle, task, root, commit):
         return {"public_passed": public.ok, "heldout_passed": bool(hidden and hidden.ok),
                 "policy_passed": policy, "policy_error": "" if policy else "out_of_scope_paths",
                 "changed_files": changed, "hidden_patch_applied": applied.returncode == 0,
-                "evaluation_output": hidden.combined(8000) if hidden else "hidden_test_patch_not_applicable"}
+                "evaluation_output": hidden.combined(8000) if hidden else "hidden_test_patch_not_applicable",
+                "evaluation_isolation": isolation.describe()}
     finally:
         box.remove()
 
@@ -218,7 +222,7 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
     arm_calls = VALIDATION_ARM_CALLS if validation else 6
     if validation:
         arms = ("single", "daedalus")
-    worker_control = ModelWorker
+    worker_control = None
     if efficiency:
         from daedalus.application.realwork_workers import baseline_worker
         worker_control = baseline_worker(DATA,cycle["baseline_worker_sha256"],
@@ -238,8 +242,27 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
     if not (1 <= max_tokens <= token_ceiling and 1 <= max_calls <= call_ceiling):
         raise ValueError("series cap exceeds the fixed release budget")
     remaining_keys={tuple(key) for key in continuation["remaining_keys"]} if continuation else None
+    worker_settings = {
+        "initial_output_tokens": 2048 if (replay is not None or contract_smoke or cycle) else 4096 if optimization else 8192,
+        "review_headroom_tokens": 8192 if (replay is not None or optimization or contract_smoke or cycle) else 2048,
+    }
+
+    def model_worker(client, arm, *, budget=None):
+        if arm == "baseline":
+            # The frozen source is the intentional historical implementation ablation.
+            return worker_control(
+                client, budget=budget, inspection_context=RepositoryInspector(),
+                **worker_settings,
+            )
+        worker = build_model_worker(
+            client, budget=budget, enable_inspection=arm != "model",
+            enable_checks=arm != "model", **worker_settings,
+        )
+        worker.enable_continuations = arm != "model"
+        return worker
+
     protocol = {
-        "version": 1, "scope": "oracle-localized upstream issues, native host; not official SWE-bench",
+        "version": 2, "scope": "oracle-localized upstream issues, native host; not official SWE-bench",
         "cases": [{k:r[k] for k in ["case", "base_commit", "targets", "labels", "archive_sha256", "source_chars"]} for r in selected],
         "task_sha256": {r["case"]:hashlib.sha256((DATA/"tasks"/r["case"]/"task.json").read_bytes()).hexdigest() for r in selected},
         "model": client.model, "inference_profile": getattr(client, "inference_profile", "configured"),
@@ -249,8 +272,23 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
         "study": replay["study"] if replay is not None else cycle.get("study", "capability-cycle-v1") if cycle else "contract-smoke-v1" if contract_smoke else "optimization-v1" if optimization else "upstream-v1",
         "cycle": {k:v for k,v in cycle.items() if k not in {"cases","monetary_admission"}} if cycle else None,
         "monetary_admission": money_context,
-        "worker_settings": {"initial_output_tokens":2048 if (replay is not None or contract_smoke or cycle) else 4096 if optimization else 8192,
-                            "review_headroom_tokens":8192 if (replay is not None or optimization or contract_smoke or cycle) else 2048},
+        "worker_settings": worker_settings,
+        "context_policy": "same localized contract and editable source for all arms; current single/Daedalus workers have matched inspection and frozen-criterion checks; no RAG/history for experimental arms; one-shot disables all observation/check/edit continuations; frozen baseline is an explicitly limited historical policy",
+        "worker_policy": {
+            arm: {
+                "name": "frozen-worker-control" if arm == "baseline" else
+                        "one-shot-no-continuations" if arm == "model" else
+                        "shared-runtime-no-rag",
+                "capabilities": {
+                    "source": "frozen-worker-context",
+                    "inspection": True, "checks": False,
+                    "reference": False, "investigation": False,
+                    "continuations": "frozen implementation",
+                    "source_sha256": cycle["baseline_worker_sha256"],
+                } if arm == "baseline" else model_worker(None, arm).capabilities,
+            }
+            for arm in arms
+        },
         "public_reproductions": {r["case"]:r["public_reproduction"] for r in selected
                                  if r.get("public_reproduction")},
         "test_contracts": {r["case"]:r["test_contract"] for r in selected if r.get("test_contract")},
@@ -391,12 +429,10 @@ def run_realwork(destination, client, *, stop_requested, max_tokens=300000, max_
             root.mkdir()
             started = time.monotonic()
             metered = MeteredClient(Guarded(), arm_calls, arm_tokens)
-            factory = worker_control if arm == "baseline" else ModelWorker
-            worker = CountedWorker(factory(metered, budget=TokenBudget(
-                max_tokens_per_run=arm_tokens, max_tokens_per_step=arm_tokens),
-                initial_output_tokens=2048 if (replay is not None or contract_smoke or cycle) else 4096 if optimization else 8192,
-                review_headroom_tokens=8192 if (replay is not None or optimization or contract_smoke or cycle) else 2048,
-                inspection_context=RepositoryInspector() if arm != "model" else None))
+            worker = CountedWorker(model_worker(
+                metered, arm, budget=TokenBudget(
+                    max_tokens_per_run=arm_tokens, max_tokens_per_step=arm_tokens),
+            ))
             outcome = {"status":"ERROR", "delivered":False, "manual_interventions":0}
             evaluated = {}
             error = None

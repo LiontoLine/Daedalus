@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import errno
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -118,6 +119,7 @@ class Tier1Gate:
     python_executable: str = "python3"
     run_tests: bool = True
     dependency_cache: Path | None = None
+    deadline_monotonic: float = 0.0
 
     def __post_init__(self) -> None:
         self.guard = BoundaryGuard(boundary=self.boundary, meta=self.meta)
@@ -131,6 +133,12 @@ class Tier1Gate:
         uniformly to linters, type checkers and acceptance tests rather than only to whatever
         the orchestrator happened to wrap.
         """
+        timeout_sec = min(timeout_sec, self.plan_node.timeout_sec)
+        if self.deadline_monotonic:
+            remaining = self.deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("shared node deadline expired before check execution")
+            timeout_sec = min(timeout_sec, remaining)
         try:
             if self.driver is None:
                 return sandbox.run(command, timeout_sec=timeout_sec)
@@ -432,6 +440,42 @@ class Tier1Gate:
         if node_criteria:
             return node_criteria, "plan_node"
         return self.goal.acceptance_criteria, "goal"
+
+    def declared_check_preconditions(
+        self, sandbox: GitSandbox, criterion: AcceptanceCriterion
+    ) -> tuple[CheckResult, ...]:
+        """Safety prerequisites for one diagnostic assertion, including an empty baseline.
+
+        This is not a gate report: it deliberately omits candidate completeness,
+        nonempty-diff, semantic review and approval checks.
+        """
+        diff = sandbox.diff()
+        paths = self.guard.check_diff(diff.files, patch=diff.patch)
+        command = self.guard.check_command(criterion.command) if criterion.command else None
+        checks = [
+            CheckResult("01_path_whitelist", paths.allowed, "; ".join(paths.violations),
+                        {"error_code": "" if paths.allowed else "boundary_violation"}),
+            self._check_forbidden_files(diff.files),
+            self._check_secret_content(diff.patch),
+            self._check_dependency_pairing(diff.files),
+            self._check_dependency_integrity(sandbox, diff.files),
+        ]
+        if command is not None:
+            checks.append(CheckResult(
+                "declared_command_policy", command.allowed, "; ".join(command.violations),
+                {"error_code": "" if command.allowed else "boundary_violation"}))
+        return tuple(checks)
+
+    def run_declared_criterion(
+        self, sandbox: GitSandbox, criterion: AcceptanceCriterion
+    ) -> tuple[CommandResult, dict[str, Any]]:
+        """Execute exactly one frozen criterion with the normal Tier-1 implementation."""
+        from daedalus.application.requirement_evidence import execute_criterion, is_behavior
+
+        if is_behavior(criterion):
+            return execute_criterion(
+                sandbox, criterion, self.boundary, self.goal.objective, run=self._run)
+        return self._run_criterion(sandbox, criterion), {}
 
     def _check_acceptance(
         self,

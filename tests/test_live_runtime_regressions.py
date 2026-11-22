@@ -447,27 +447,40 @@ def test_unexecutable_verification_nodes_are_repaired_before_intake_freeze(defec
     assert "write" in result.plan.nodes[0].allowed_tools
 
 
-@pytest.mark.parametrize("has_local_check", [False, True])
-def test_upstream_candidates_need_independent_checks_or_an_atomic_fallback(has_local_check):
+@pytest.mark.parametrize("defect", ["none", "missing_local_check", "shared_output", "goal_as_local"])
+def test_generated_plan_requires_locally_gateable_distinct_outputs(defect):
     from daedalus.domain.spec import AcceptanceCriterion, AssertionKind
 
-    request = PlanRequest("r", "g", "coupled API", (TARGET,), TEST_COMMAND)
+    consumer = "src/example_project/report.py"
+    request = PlanRequest("r", "g", "fix producer and report", (TARGET, consumer), TEST_COMMAND)
     original = DeterministicPlanner().plan(request)
-    local = (AcceptanceCriterion(
-        criterion_id="node-check", kind=AssertionKind.EXIT_CODE,
-        statement="validate this module independently", command="python3 -c 'assert True'",
-    ),) if has_local_check else ()
-    first = replace(original.plan.nodes[0], node_id="first",
-                    extra={"acceptance_criteria": [c.to_dict() for c in local]})
-    second = replace(original.plan.nodes[0], node_id="second", deps=("first",),
-                     extra={"acceptance_criteria": [c.to_dict() for c in original.goal.acceptance_criteria]}
-                     if has_local_check else {})
+    local = AcceptanceCriterion(
+        criterion_id="producer-check", kind=AssertionKind.EXIT_CODE,
+        command="python3 -m pytest tests/test_textstats.py -q",
+    )
+    joined = AcceptanceCriterion(
+        criterion_id="consumer-check", kind=AssertionKind.EXIT_CODE,
+        command=TEST_COMMAND if defect == "goal_as_local" else "python3 checks/verify_report.py",
+    )
+    first = replace(original.plan.nodes[0], node_id="producer", objective="fix word counting",
+        expected_artifacts=(TARGET,), extra={
+            "acceptance_criteria": [] if defect == "missing_local_check" else [local.to_dict()],
+        })
+    second = replace(original.plan.nodes[0], node_id="report", deps=("producer",),
+        objective="use producer counts in report",
+        expected_artifacts=(TARGET if defect == "shared_output" else consumer,),
+        extra={"acceptance_criteria": [joined.to_dict()]})
     candidate = replace(original, plan=replace(original.plan, nodes=(first, second)))
     client = MockModelClient(responder=lambda messages: json.dumps(candidate.to_dict()))
     result = ModelPlanner(client=client).plan(request)
-    assert len(result.plan.nodes) == (2 if has_local_check else 1)
     assert result.goal.acceptance_criteria == original.goal.acceptance_criteria
-    assert result.boundary.fs_whitelist == original.boundary.fs_whitelist
+    assert result.boundary.fs_whitelist == request.target_paths
+    if defect == "none":
+        assert result.plan.integrated_acceptance
+        assert result.plan.topo_order() == ("producer", "report")
+        assert result.plan.node("report").deps == ("producer",)
+    else:
+        assert not result.plan.integrated_acceptance and len(result.plan.nodes) == 1
 
 
 @pytest.mark.parametrize("expression", ["self._peek()", "self.tokens[self.pos]", "next_token()"])

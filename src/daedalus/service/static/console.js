@@ -557,20 +557,15 @@ function initOperations() {
  * A page with no entry here now throws, so the next missing wiring is loud on first load. */
 const PAGE_INITIALISERS = {
   workflow: () => initWorkflow(),
-  intake: () => initIntake(),
   board: () => initBoard(),
   escalations: () => initEscalations(),
   operations: () => initOperations(),
-  planning: () => initModule(),
-  execution: () => initModule(),
-  audit: () => initModule(),
 };
 
 document.addEventListener("DOMContentLoaded", () => {
   initModelPanel();
   initServicePanel();
-  const page = document.body.dataset.page ||
-    (window.DAEDALUS_RUN_ID ? "execution" : "board");
+  const page = document.body.dataset.page || "board";
   const initialise = PAGE_INITIALISERS[page];
   // Every error container on the page, because which one exists depends on the page and a
   // failure that renders nowhere is a failure nobody sees.
@@ -1005,7 +1000,7 @@ function wireDiffMode() {
  * gates and history. Silent polling preserves selection, zoom, tabs and decision input.
  * ====================================================================== */
 
-const STEP = { w: 232, h: 120, gap: 64, pad: 24 };
+const STEP = { w: 244, h: 122, gap: 84, pad: 28 };
 
 const STATE_SKIN = {
   COMMITTED: { edge: "#3fb37f", dot: "#4ade9a", fill: "#15201e" },
@@ -1126,19 +1121,37 @@ function buildDagLayout(models) {
     layer.forEach((model, row) => slots.set(model.step.node_id, row));
   });
   const rows = Math.max(1, ...layers.map((layer) => layer.length));
+  let above = 0;
+  for (const edge of edges) {
+    if (ranks.get(edge.to) - ranks.get(edge.from) > 1) edge.lane = above++;
+  }
+  const routeHeight = above ? 12 + 10 * above : 0;
   const points = new Map();
   layers.forEach((layer, rank) => layer.forEach((model, row) => {
     points.set(model.step.node_id, {
       x: STEP.pad + rank * (STEP.w + STEP.gap),
-      y: STEP.pad + ((rows - layer.length) / 2 + row) * (STEP.h + 54), model,
+      y: STEP.pad + routeHeight + ((rows - layer.length) / 2 + row) * (STEP.h + 44), model,
     });
   }));
   return {
     points, edges, missing, cyclic: visited !== models.length,
     width: STEP.pad * 2 + Math.max(1, layers.length) * STEP.w
       + Math.max(0, layers.length - 1) * STEP.gap,
-    height: STEP.pad * 2 + rows * STEP.h + (rows - 1) * 54,
+    height: STEP.pad * 2 + routeHeight + rows * STEP.h + (rows - 1) * 44,
   };
+}
+
+function dagEdgePath(layout, edge) {
+  const source = layout.points.get(edge.from), target = layout.points.get(edge.to);
+  const x1 = source.x + STEP.w + 2, y1 = source.y + STEP.h / 2;
+  const x2 = target.x - 4, y2 = target.y + STEP.h / 2;
+  if (edge.lane !== undefined) {
+    const left = x1 + STEP.gap / 3, right = x2 - STEP.gap / 3;
+    const track = STEP.pad + edge.lane * 10;
+    return `M ${x1} ${y1} H ${left - 9} Q ${left} ${y1} ${left} ${y1 - 9} V ${track + 9} Q ${left} ${track} ${left + 9} ${track} H ${right - 9} Q ${right} ${track} ${right} ${track + 9} V ${y2 - 9} Q ${right} ${y2} ${right + 9} ${y2} H ${x2}`;
+  }
+  const mid = (x1 + x2) / 2;
+  return `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`;
 }
 
 function renderLane(models, route) {
@@ -1170,11 +1183,9 @@ function renderLane(models, route) {
   layout.edges.forEach((edge) => {
     const source = layout.points.get(edge.from);
     const target = layout.points.get(edge.to);
-    const x1 = source.x + STEP.w + 3, y1 = source.y + STEP.h / 2;
-    const x2 = target.x - 6, y2 = target.y + STEP.h / 2;
-    const mid = (x1 + x2) / 2;
+    if (target.x <= source.x) return;
     const path = document.createElementNS(ns, "path");
-    path.setAttribute("d", `M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`);
+    path.setAttribute("d", dagEdgePath(layout, edge));
     path.setAttribute("class", "lane-edge");
     path.setAttribute("data-from", source.model.step.step_id);
     path.setAttribute("data-to", target.model.step.step_id);
@@ -1269,10 +1280,53 @@ function renderRepairLineage(branches) {
     }).join("") + '</details>';
 }
 
+function renderRepairDiagnosis(trunk) {
+  const snapshot = (trunk.snapshots || []).at(-1);
+  if (!trunk.digest || snapshot?.digest !== trunk.digest) return "";
+  const diagnosis = snapshot.diagnosis;
+  const issues = diagnosis?.criteria || [];
+  if (!issues.length && !diagnosis?.criteria_omitted) return "";
+  const evidence = new Map();
+  for (const node of snapshot.nodes || []) {
+    for (const row of node.expectations || []) {
+      if (!evidence.has(row.criterion_id)) evidence.set(row.criterion_id, row);
+    }
+  }
+  for (const row of snapshot.integrated_expectations || []) evidence.set(row.criterion_id, row);
+  const reasons = {
+    integrated_check_has_no_node_owner: "整体验收未绑定唯一修复节点",
+    no_executed_behavior_failure: "原生行为未失败，审查疑点不自动定位改动",
+    ambiguous_global_ownership: "整体验收涉及多个可能节点，未选择",
+    no_frozen_owner: "没有冻结节点归属",
+    no_declared_output_scope: "节点未声明可修复产物",
+    excluded_or_failed_prerequisite: "候选已排除或前置节点仍未满足",
+    missing_or_unknown_evidence: "缺少完整执行证据",
+    infrastructure_or_dependency_blocked: "验收受环境或依赖阻断",
+    stale_evidence: "证据已过期，须在当前主干重验",
+  };
+  return '<section class="expectation-evidence" aria-label="当前主干诊断"><h3>当前主干诊断</h3><ul class="expectation-criteria">'
+    + issues.map((row) => {
+      const state = expectationState(row.status);
+      const owners = (row.owner_candidates || []).map((owner) => owner.node_id);
+      const expectation = evidence.get(row.criterion_id);
+      const gaps = new Set((expectation?.checks || []).filter((check) => check.status !== "MET")
+        .map((check) => `${check.path_id || check.requirement_id} · ${expectationState(check.status)}`));
+      return `<li><span class="expectation-state expectation-${state}">${state}</span> `
+        + `<strong>${escapeHtml(row.criterion_id)}</strong>`
+        + (expectation?.statement ? `<p>${escapeHtml(expectation.statement)}</p>` : "")
+        + (gaps.size ? `<p>行为路径：${escapeHtml([...gaps].join("；"))}</p>` : "")
+        + (reasons[row.non_repairable_reason] ? `<p>${escapeHtml(reasons[row.non_repairable_reason])}</p>` : "")
+        + (owners.length ? `<p>冻结归属：${escapeHtml(owners.join("、"))}</p>` : "") + '</li>';
+    }).join("") + '</ul>'
+    + (diagnosis.criteria_omitted ? `<p class="muted">另有 ${Number(diagnosis.criteria_omitted)} 项未展开</p>` : "")
+    + '</section>';
+}
+
 function renderTrunkSummary(trunk) {
   if (!trunk || !trunk.enabled) return "";
   return '<section class="trunk-summary" aria-label="当前主干"><h3>当前主干</h3>'
     + `<p>${hashCell(trunk.commit)}</p><p class="expectation-disclaimer">${escapeHtml(trunk.coverage_disclaimer)}</p>`
+    + renderRepairDiagnosis(trunk)
     + renderRepairLineage(trunk.branches)
     + (trunk.snapshots && trunk.snapshots.length
       ? `<details class="evidence-disclosure" data-disclosure="trunk-snapshots"><summary>不可变主干快照 · ${trunk.snapshots.length}</summary>`
@@ -1299,21 +1353,17 @@ function stepNode(model, x, y) {
     if (text !== undefined) element.textContent = text;
     group.appendChild(element); return element;
   };
-  add("rect", { width: STEP.w, height: STEP.h, rx: 9, fill: skin.fill, stroke: skin.edge });
-  add("text", { x: 16, y: 23, class: "lane-index" }, "STEP " + String(model.index).padStart(2, "0"));
-  add("circle", { cx: STEP.w - 17, cy: 20, r: 3, fill: skin.dot });
-  add("text", { x: 16, y: 46, class: "lane-title" }, nodeLabel(model.plan.objective || step.node_id));
-  add("text", { x: 16, y: 66, class: "lane-state" }, stateText(step.state));
-  add("text", { x: 16, y: 85, class: model.plan.expectation_status
+  const status = stateText(step.state);
+  add("rect", { width: STEP.w, height: STEP.h, rx: 12, fill: skin.fill, stroke: skin.edge });
+  add("text", { x: 16, y: 26, class: "lane-index" }, String(model.index).padStart(2, "0"));
+  add("circle", { cx: 46, cy: 22, r: 4, fill: skin.dot });
+  add("text", { x: 57, y: 26, class: "lane-state" }, status);
+  add("text", { x: 16, y: 58, class: "lane-title" }, nodeLabel(model.plan.objective || step.node_id, STEP.w - 24));
+  add("line", { x1: 16, y1: 77, x2: STEP.w - 16, y2: 77, class: "lane-rule" });
+  add("text", { x: 16, y: 101, class: model.plan.expectation_status
     ? "lane-expectation expectation-" + expectationState(model.plan.expectation_status) : "lane-meta" },
     model.plan.expectation_status ? `预期 ${expectationState(model.plan.expectation_status)} · ${Math.round((model.plan.expectation_score || 0) * 100)}% 证据覆盖`
-      : `尝试 ${step.attempt}/${step.max_attempts}` + (model.attempts.length > 1
-        ? ` · 重试 ${model.attempts.length - 1}` : ""));
-  const phase = phaseIndex(model);
-  for (let i = 0; i < 4; i += 1) {
-    add("rect", { x: 16 + i * 51, y: 100, width: 44, height: 3, rx: 1.5,
-      fill: phaseEvidenceMissing(model, i) ? "#303845" : i < phase ? "#52977e" : (i === phase && !["PENDING", "READY", "NOT_DECLARED"].includes(step.state) ? "#8caafa" : "#303845") });
-  }
+      : (model.plan.deps || []).length ? `${(model.plan.deps || []).length} 个前置步骤` : "起始步骤");
   const tip = add("title", {}, [step.node_id, model.plan.objective || "", stateText(step.state),
     step.last_failure || "", "点击查看步骤总览"].filter(Boolean).join("\n"));
   tip.setAttribute("data-tooltip", "step");
@@ -1359,6 +1409,7 @@ async function selectStep(model, preserveTab = false) {
   if (changed) { const scroll = $("#inspector-scroll"); if (scroll) scroll.scrollTop = 0; }
   WORKSPACE.selectedId = model.step.step_id;
   if (changed && !preserveTab) WORKSPACE.tab = "overview";
+  if (!preserveTab) showGraphInspector(true);
   highlightSelection();
   const tabs = $("#inspector-tabs"); if (tabs) tabs.hidden = false;
   const decisionPanel = $("#escalation-panel");
@@ -1417,12 +1468,12 @@ function setGraphZoom(zoom) {
   if (label) label.textContent = Math.round(WORKSPACE.zoom * 100) + "%";
 }
 
-function fitGraph() {
+function fitGraph(minimum = .2) {
   const viewport = $("#lane");
   const layout = WORKSPACE.layout;
   if (!viewport || !layout || !viewport.clientWidth || !viewport.clientHeight) return;
-  setGraphZoom(Math.min(1, (viewport.clientWidth - 76) / layout.width,
-    (viewport.clientHeight - 76) / layout.height));
+  setGraphZoom(Math.max(minimum, Math.min(1, (viewport.clientWidth - 76) / layout.width,
+    (viewport.clientHeight - 76) / layout.height)));
   viewport.scrollLeft = 0; viewport.scrollTop = 0;
 }
 
@@ -1431,19 +1482,33 @@ function focusGraphNode(model) {
   if (node) node.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
 }
 
+function showGraphInspector(open) {
+  const button = $("#graph-inspector"), panel = $("#step-panel");
+  if (!button || !panel) return;
+  panel.hidden = !open;
+  panel.closest?.(".workspace-shell")?.classList.toggle("inspector-open", open);
+  button.setAttribute("aria-expanded", String(open));
+  button.textContent = open ? "收起详情" : "任务详情";
+}
+
 function bindWorkspace() {
   if (WORKSPACE.bound) return;
   WORKSPACE.bound = true;
   const click = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
   click("graph-zoom-in", () => setGraphZoom(WORKSPACE.zoom + .15));
   click("graph-zoom-out", () => setGraphZoom(WORKSPACE.zoom - .15));
-  click("graph-fit", fitGraph);
+  click("graph-fit", () => fitGraph());
   click("focus-step", () => {
     const model = stepModels.find((item) => ["RUNNING", "ESCALATED", "TIER2_REVIEWING", "AWAITING_GATEKEEPER", "LEASED"].includes(item.step.state))
       || stepModels.find((item) => item.step.step_id === WORKSPACE.selectedId) || stepModels[0];
     if (model) { setGraphZoom(1); void selectStep(model); focusGraphNode(model); }
   });
-  click("inspector-close", () => { WORKSPACE.selectedId = ""; WORKSPACE.inspectorKey = ""; renderTaskOverview(); highlightSelection(); });
+  click("graph-inspector", () => showGraphInspector(Boolean($("#step-panel")?.hidden)));
+  click("inspector-close", () => {
+    WORKSPACE.selectedId = ""; WORKSPACE.inspectorKey = "";
+    renderTaskOverview(); highlightSelection(); showGraphInspector(false);
+    $("#graph-inspector")?.focus();
+  });
   $$("#inspector-tabs button").forEach((button, index, buttons) => {
     const choose = () => {
       const model = stepModels.find((item) => item.step.step_id === WORKSPACE.selectedId);
@@ -1492,11 +1557,6 @@ function runStateLabel(state) {
     FAILED: "失败", CANCELLED: "已取消", PENDING: "待执行" })[state] || state;
 }
 
-function syncRunNavigation(runId) {
-  $$("[data-module]").forEach((link) => {
-    link.href = "/" + link.dataset.module + (runId ? "/" + encodeURIComponent(runId) : "");
-  });
-}
 
 /*: `replayBase(model)` is the commit this step replays from, or "" when the run never recorded
    one. A step that committed reports the commit it produced — replaying from it reuses the
@@ -1787,6 +1847,7 @@ async function loadExecution() {
     currentRunDetail = detail; currentRoute = route; WORKSPACE.plan = plan;
     if (isWorkflow()) {
       WORKFLOW.run = detail.run; WORKFLOW.goal = goalAudit; WORKFLOW.validation = validation;
+      WORKFLOW.delivery = detail.delivery;
       WORKFLOW.available.execute = true;
       renderWorkflowProgress(); updateWorkflowSections();
     }
@@ -1798,12 +1859,12 @@ async function loadExecution() {
     const heading = $("#workflow-title"); if (heading) heading.textContent = plan.objective || plan.goal_id;
     const note = $("#run-note"); if (note) note.innerHTML = pill(detail.run.status) + '<span>'
       + escapeHtml(plan.goal_id) + '</span><code>' + escapeHtml(shortDigest(runId, 18)) + '</code>';
-    syncRunNavigation(runId); renderRunStats(route, stepModels);
+    renderRunStats(route, stepModels);
     const graphKey = JSON.stringify(stepModels);
     if (graphKey !== WORKSPACE.graphKey) {
       WORKSPACE.graphKey = graphKey; renderLane(stepModels, route);
     }
-    if (!WORKSPACE.fitted) { fitGraph(); WORKSPACE.fitted = true; }
+    if (!WORKSPACE.fitted && $("#lane")?.clientWidth) { fitGraph(.65); WORKSPACE.fitted = true; }
     const notes = $("#route-notes"); if (notes) notes.textContent = (route.notes || []).join(" ");
     const events = (route.nodes || []).flatMap((node) => node.kind === "attempt" ? node.events || [] : [node]);
     events.sort((a, b) => String(a.timestamp || a.started_at || "").localeCompare(String(b.timestamp || b.started_at || "")));
@@ -1842,6 +1903,7 @@ async function loadAudit() {
   updateValidationPanel(audit.independent_validation, runId, detail.run || {});
   if (isWorkflow()) {
     WORKFLOW.run = detail.run;
+    WORKFLOW.delivery = detail.delivery;
     if (audit.goal_audit) WORKFLOW.goal = audit.goal_audit;
     WORKFLOW.validation = audit.independent_validation || WORKFLOW.validation;
     WORKFLOW.available.audit = true;
@@ -1853,6 +1915,7 @@ async function loadAudit() {
   const summary = $("#audit-summary");
   if (summary) summary.innerHTML = summaryTiles([
     ["任务状态", runStateLabel((detail.run || {}).status || "UNKNOWN")],
+    ["Git 交付", deliveryLabel(detail.delivery)],
     ["已提交步骤", (detail.steps || []).filter((s) => s.state === "COMMITTED").length + " / " + (detail.steps || []).length],
     ["改动文件", new Set((detail.steps || []).flatMap((s) => (s.artifacts || []).flatMap((a) => a.changed_files || []))).size],
     ["证据评分", score ? score.score + " / 100" : "暂无记录"],
@@ -1936,42 +1999,8 @@ async function loadDiff(stepId) {
  * Module pages: shared shell
  * ====================================================================== */
 
-const MODULE_RUN = { id: document.body.dataset.runId || window.DAEDALUS_RUN_ID || "" };
+const MODULE_RUN = { id: document.body.dataset.runId || "" };
 
-async function initRunPicker(onChange) {
-  const picker = $("#run-picker");
-  if (!picker) return "";
-  let selected = MODULE_RUN.id;
-  try {
-    const payload = await api("/api/runs");
-    const runs = (payload.runs || []).slice().reverse();
-    picker.innerHTML = runs.map((run) => `<option value="${escapeHtml(run.run_id)}">${
-      escapeHtml(ellipsis(run.objective || run.goal_id, 45))} · ${escapeHtml(runStateLabel(run.status))}</option>`).join("") || '<option value="">没有 run</option>';
-    if (!selected && runs.length) selected = runs[0].run_id;
-    picker.value = selected;
-    picker.addEventListener("change", () => {
-      MODULE_RUN.id = picker.value;
-      const base = window.location.pathname.split("/").slice(0, 2).join("/");
-      window.history.replaceState({}, "", `${base}/${picker.value}`);
-      syncRunNavigation(picker.value);
-      onChange(picker.value);
-      updateRunNote(runs.find((candidate) => candidate.run_id === picker.value));
-      refreshBadge();
-    });
-    updateRunNote(runs.find((candidate) => candidate.run_id === selected));
-    if (!runs.length) {
-      const note = $("#run-note");
-      if (note) note.innerHTML = '还没有任务。<a href="/">创建第一个任务 →</a>';
-    }
-  } catch (error) {
-    showError("#planning-error", error);
-    showError("#execution-error", error);
-    showError("#audit-error", error);
-  }
-  MODULE_RUN.id = selected;
-  syncRunNavigation(selected);
-  return selected;
-}
 
 
 /* ======================================================================
@@ -1991,26 +2020,25 @@ const INTAKE = {
   session: null,
   index: 0,
   specs: [],
+  pending: "",
 };
 
 function showIntakeStep(step) {
-  if (isWorkflow()) {
-    WORKFLOW.draftStage = step;
-    updateWorkflowSections(); renderWorkflowProgress();
-    if (step === "review") focusWorkflowStage("plan");
-  }
-  $$("[data-create-stage]").forEach((item) => {
-    if (item.dataset.createStage === step) item.setAttribute("aria-current", "step");
-    else item.removeAttribute("aria-current");
-  });
-  for (const name of ["task", "questions", "review", "recent"]) {
+  for (const name of ["task", "questions", "review"]) {
     const section = $(`#intake-step-${name}`);
     if (section) section.hidden = name !== step;
+  }
+  if (isWorkflow()) {
+    WORKFLOW.draftStage = step;
+    if (!MODULE_RUN.id) focusWorkflowStage(step === "review" ? "plan" : "task");
+    else updateWorkflowSections();
   }
 }
 
 function renderIntakeRepos() {
   const host = $("#intake-repos");
+  const label = $("#chat-repo-label");
+  if (label) label.textContent = INTAKE.repo ? `仓库 · ${INTAKE.repo.split("/").filter(Boolean).pop()}` : "选择 Git 仓库";
   if (!host) return;
   if (!INTAKE.repos.length) {
     host.innerHTML = `<p class="muted">这个工作区还没有跑过任何仓库。用下面的「其他路径…」
@@ -2030,31 +2058,12 @@ function renderIntakeRepos() {
       renderIntakeRepos();
       const field = $("#intake-repo-path");
       if (field) field.classList.add("hidden");
+      const repository = $("#chat-repository");
+      if (repository) repository.open = false;
     });
   });
 }
 
-function renderIntakeRecent(items) {
-  const host = $("#intake-recent");
-  const section = $("#intake-step-recent");
-  if (!host || !section) return;
-  const rows = items || [];
-  if (!rows.length) { section.hidden = true; return; }
-  section.hidden = false;
-  host.innerHTML = `<table class="table"><thead><tr>
-      <th>任务</th><th>仓库</th><th>状态</th><th>模型</th><th>digest</th><th>run</th>
-    </tr></thead><tbody>${rows.map((row) => `<tr>
-      <td>${escapeHtml(ellipsis(row.objective, 52))}</td>
-      <td class="muted">${escapeHtml(ellipsis(row.repo_path, 30))}</td>
-      <td>${pill(row.status)}</td>
-      <td class="muted">${escapeHtml(row.model || "—")}</td>
-      <td class="mono">${escapeHtml(shortDigest(row.spec_digest, 12))}</td>
-      <td class="mono">${row.run_id
-        ? `<a href="/execution/${encodeURIComponent(row.run_id)}">${escapeHtml(
-            shortDigest(row.run_id, 16))}</a>`
-        : "—"}</td>
-    </tr>`).join("")}</tbody></table>`;
-}
 
 function renderIntakeError(target, error) {
   const host = $(target);
@@ -2070,26 +2079,17 @@ function renderIntakeError(target, error) {
 
 async function loadIntake() {
   try {
-    const [repos, recent] = await Promise.all([
-      api("/api/repos"),
-      api("/api/intakes?limit=8").catch(() => ({ intakes: [] })),
-    ]);
+    const repos = await api("/api/repos");
     INTAKE.repos = repos.repos || [];
     if (!INTAKE.repo && INTAKE.repos.length) INTAKE.repo = INTAKE.repos[0].path;
     renderIntakeRepos();
-    renderIntakeRecent(recent.intakes);
-    const note = $("#intake-model-note");
-    if (note) {
-      note.textContent = INTAKE.repos.length
-        ? "模型会先只读地看一遍这个仓库，不会执行任何东西。"
-        : "";
-    }
   } catch (error) {
     renderIntakeError("#intake-error", error);
   }
 }
 
 async function startIntake() {
+  if (INTAKE.pending) return;
   if (MODEL_REPORT && !(MODEL_REPORT.roles || []).length) { await openModelSettings(); return; }
   const objective = ($("#intake-objective") ? $("#intake-objective").value : "").trim();
   const typed = $("#intake-repo-path");
@@ -2102,27 +2102,26 @@ async function startIntake() {
     return;
   }
   if (!repo) {
+    const repository = $("#chat-repository");
+    if (repository) repository.open = true;
     renderIntakeError("#intake-error", { message: "先选一个仓库，或者填一个路径" });
     return;
   }
   const button = $("#intake-start");
-  if (button) { button.disabled = true; button.textContent = "模型正在读仓库…"; }
+  INTAKE.pending = "正在只读分析仓库…";
+  INTAKE.session = null;
+  INTAKE.objective = objective;
+  if (button) { button.disabled = true; button.textContent = "分析中…"; }
+  if (isWorkflow()) updateWorkflowSections();
   try {
-    INTAKE.objective = objective;
     INTAKE.repo = repo;
+    renderIntakeRepos();
     const payload = await api("/api/intakes", {
       method: "POST",
       body: JSON.stringify({ repo_path: repo, objective }),
     });
     INTAKE.session = payload.intake;
     INTAKE.index = 0;
-    INTAKE.facts = payload.facts;
-    const note = $("#intake-model-note");
-    if (note) {
-      note.textContent = `模型 ${payload.intake.model} 读完 ${
-        payload.facts.manifests.join(" / ") || "仓库"} 之后问了 ${
-        payload.intake.questions.length} 个问题。`;
-    }
     if (!INTAKE.session.questions.length) {
       await deriveIntakeSpec();
       return;
@@ -2132,7 +2131,10 @@ async function startIntake() {
   } catch (error) {
     renderIntakeError("#intake-error", error);
   } finally {
-    if (button) { button.disabled = false; button.textContent = "分析任务 →"; }
+    INTAKE.pending = "";
+    if (!INTAKE.session) INTAKE.objective = "";
+    if (button) { button.disabled = false; button.textContent = "发送 ↑"; }
+    if (isWorkflow()) updateWorkflowSections();
   }
 }
 
@@ -2200,9 +2202,16 @@ function renderIntakeQuestion() {
   }
 }
 
-async function answerIntake(questionId, optionId, freeText) {
+async function answerIntake(questionId, optionId, freeText, skip = false) {
+  if (INTAKE.pending) return;
+  INTAKE.pending = "正在记录回答…";
+  const errorHost = $("#intake-error");
+  if (errorHost) errorHost.hidden = true;
+  $("#intake-step-questions")?.setAttribute("inert", "");
+  if (isWorkflow()) updateWorkflowSections();
   try {
     const body = { question_id: questionId };
+    if (skip) body.skip = true;
     if (optionId) body.option_id = optionId;
     if (freeText) body.free_text = freeText;
     const payload = await api(
@@ -2220,33 +2229,26 @@ async function answerIntake(questionId, optionId, freeText) {
     await deriveIntakeSpec();
   } catch (error) {
     renderIntakeError("#intake-error", error);
-    showIntakeStep("task");
+  } finally {
+    INTAKE.pending = "";
+    $("#intake-step-questions")?.removeAttribute("inert");
+    if (isWorkflow()) updateWorkflowSections();
   }
 }
 
-async function skipIntakeQuestion() {
-  const question = INTAKE.session.questions[INTAKE.index];
-  try {
-    const payload = await api(
-      `/api/intakes/${encodeURIComponent(INTAKE.session.intake_id)}/answers`,
-      { method: "POST", body: JSON.stringify({ question_id: question.id, skip: true }) },
-    );
-    INTAKE.session = payload.intake;
-    if (INTAKE.index < INTAKE.session.questions.length - 1) {
-      INTAKE.index += 1;
-      renderIntakeQuestion();
-    } else {
-      await deriveIntakeSpec();
-    }
-  } catch (error) {
-    renderIntakeError("#intake-error", error);
-  }
+function skipIntakeQuestion() {
+  const question = INTAKE.session?.questions[INTAKE.index];
+  if (question) return answerIntake(question.id, "", "", true);
 }
 
 async function deriveIntakeSpec() {
+  const requirementCheckId = $("#intake-requirement-check-id")?.value.trim() || "";
+  const requireBehaviorPaths = Boolean($("#intake-require-behavior-paths")?.checked);
   const payload = await api(
     `/api/intakes/${encodeURIComponent(INTAKE.session.intake_id)}/spec`,
-    { method: "POST" },
+    { method: "POST", body: JSON.stringify({
+      requirement_check_id: requirementCheckId, require_behavior_paths: requireBehaviorPaths,
+    }) },
   );
   INTAKE.session = payload.intake;
   INTAKE.specs = payload.specs || [];
@@ -2266,6 +2268,22 @@ async function deriveIntakeSpec() {
     const unasked = payload.intake.unasked_policy_fields || [];
     const adjustments = payload.adjustments || [];
     const lines = [];
+    if (payload.requirement_check_id) {
+      lines.push(`已冻结独立行为验收：<code>${escapeHtml(payload.requirement_check_id)}</code>。`);
+    }
+    const paths = (payload.document?.spec_01_goal?.acceptance_criteria || [])
+      .flatMap((criterion) => criterion.behavior_paths || []);
+    if (paths.length) {
+      const statuses = { MET: "基线通过", UNMET: "基线未满足", UNKNOWN: "基线未知" };
+      lines.push("<strong>冻结的用户路径（不是当前候选通过）</strong>");
+      for (const path of paths) {
+        const flow = [path.entry, ...path.steps, path.outcome].map(escapeHtml).join(" → ");
+        lines.push(`<strong>${escapeHtml(path.id)}</strong> · ${path.role === "change" ? "变更" : "保留"}`
+          + ` · ${escapeHtml(statuses[path.status] || "基线未知")}：${flow}`);
+      }
+    } else {
+      lines.push("完整用户路径覆盖：未知（未绑定路径收据）。");
+    }
     if (asked.length) {
       lines.push(`由你点击决定：${asked.map(escapeHtml).join("、")}`);
     }
@@ -2299,6 +2317,8 @@ async function deriveIntakeSpec() {
 }
 
 async function freezeIntake() {
+  if (INTAKE.pending) return;
+  INTAKE.pending = "正在冻结规划…";
   const out = $("#intake-freeze-out");
   const button = $("#intake-freeze");
   const show = (message, bad) => {
@@ -2311,17 +2331,22 @@ async function freezeIntake() {
   try {
     const payload = await api(
       `/api/intakes/${encodeURIComponent(INTAKE.session.intake_id)}/freeze`,
-      { method: "POST", body: JSON.stringify({spec_digest: INTAKE.session.spec_digest, use_model: true, enable_review: true}) },
+      { method: "POST", body: JSON.stringify({
+        spec_digest: INTAKE.session.spec_digest, use_model: true, enable_review: true,
+        require_behavior_paths: Boolean($("#intake-require-behavior-paths")?.checked),
+      }) },
     );
     show(`已冻结 spec ${shortDigest(payload.spec_digest, 12)}，run ${
       shortDigest(payload.run_id, 16)} 已受理。`);
     INTAKE.session = { ...INTAKE.session, status: "FROZEN", run_id: payload.run_id };
-    if (isWorkflow()) await openWorkflowRun(payload.run_id, "execute");
-    else window.location.href = `/execution/${encodeURIComponent(payload.run_id)}`;
+    if (!isWorkflow()) window.location.href = `/execution/${encodeURIComponent(payload.run_id)}`;
+    else if (!MODULE_RUN.id) await openWorkflowRun(payload.run_id, "execute");
+    else await refreshWorkflowRuns();
   } catch (error) {
     show(error.detail ? (typeof error.detail === "string"
       ? error.detail : JSON.stringify(error.detail)) : error.message, true);
   } finally {
+    INTAKE.pending = "";
     if (button) { button.disabled = false; button.textContent = "确认并开始执行"; }
   }
 }
@@ -2563,12 +2588,10 @@ function initModelPanel() {
 
 
 function initIntake() {
-  $$("[data-objective]").forEach((button) => button.addEventListener("click", () => {
-    const input = $("#intake-objective");
-    if (input) { input.value = button.dataset.objective; input.focus(); }
-  }));
-  const start = $("#intake-start");
-  if (start) start.addEventListener("click", startIntake);
+  const composer = $("#intake-composer");
+  if (composer) composer.addEventListener("submit", (event) => {
+    event.preventDefault(); void startIntake();
+  });
   const other = $("#intake-other-repo");
   if (other) other.addEventListener("click", () => {
     const field = $("#intake-repo-path");
@@ -2579,7 +2602,9 @@ function initIntake() {
   const objective = $("#intake-objective");
   if (objective) {
     objective.addEventListener("keydown", (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") startIntake();
+      if (!event.isComposing && !event.shiftKey && event.key === "Enter") {
+        event.preventDefault(); composer?.requestSubmit();
+      }
     });
   }
   const back = $("#intake-back");
@@ -2597,6 +2622,7 @@ function initIntake() {
   });
   const edit = $("#intake-edit");
   if (edit) edit.addEventListener("click", () => {
+    if (!INTAKE.session?.questions.length) { showIntakeStep("task"); return; }
     INTAKE.index = 0;
     showIntakeStep("questions");
     renderIntakeQuestion();
@@ -2607,42 +2633,6 @@ function initIntake() {
   loadIntake();
 }
 
-async function initModule() {
-  const page = document.body.dataset.page;
-  if (page === "intake") {
-    // The intake is not a polling view: it is a conversation, and re-rendering it under the
-    // operator's cursor would move the option they were about to click.
-    initIntake();
-    await refreshBadge();
-    return;
-  }
-  const load = { planning: loadPlanning, execution: loadExecution, audit: loadAudit }[page];
-  if (!load) return;
-  let loadSequence = 0;
-  const loader = async () => {
-    const request = ++loadSequence;
-    const runId = MODULE_RUN.id;
-    try { await load(); if (request === loadSequence && runId === MODULE_RUN.id) showError(`#${page}-error`, null); }
-    catch (error) { if (request === loadSequence && runId === MODULE_RUN.id) showError(`#${page}-error`, error); }
-  };
-  if (page === "audit") bindAuditViews();
-  await initRunPicker(loader);
-  if (!MODULE_RUN.id && page !== "execution") {
-    for (const selector of ["#spec-cards", "#spec-approval", "#spec-registry", "#audit", "#diff", "#plan-map", "#audit-main"]) {
-      const host = $(selector);
-      if (host) host.innerHTML = '<p class="empty">创建任务后，这里将展示对应的计划与执行证据。</p>';
-    }
-  }
-  if (page === "execution") bindWorkspace();
-  await loader();
-  if ($("#auto-refresh")) startPolling(loader);
-  else {
-    const refresh = $("#refresh");
-    if (refresh) refresh.addEventListener("click", loader);
-  }
-  wireDiffMode();
-  await refreshBadge();
-}
 
 /* Shared task journey: summaries first, evidence on demand. */
 const BOARD = { runs: [] };
@@ -2677,11 +2667,6 @@ function renderTaskCards() {
     return `<article class="task-card"><header><span class="task-state ${escapeHtml(taskCategory(run))}">${escapeHtml(runStateLabel(run.status))}</span><span class="muted">${escapeHtml(timeAgo(run.updated_at || run.created_at))}</span></header><h3><a href="/execution/${id}">${escapeHtml(run.objective || run.goal_id)}</a></h3><p class="muted">${escapeHtml(run.goal_id)} · ${done} / ${total} 个已声明步骤已提交</p><div class="bar" role="progressbar" aria-label="已声明步骤提交比例" aria-valuenow="${percent}" aria-valuemin="0" aria-valuemax="100"><span style="width:${percent}%"></span></div><footer><a href="/planning/${id}">查看计划</a><a href="/audit/${id}">变更审计</a><a class="task-open" href="/execution/${id}">打开工作台 ↗</a></footer></article>`;
   }).join("") || `<div class="empty-state"><h3>${runs.length ? "没有匹配的任务" : "从第一个目标开始"}</h3><p class="muted">${runs.length ? "试试其他关键词或切换状态筛选。" : "描述目标，确认计划，在工作台跟踪每一步。"}</p>${runs.length ? "" : '<a class="button primary" href="/">＋ 新建任务</a>'}</div>`;
 }
-function updateRunNote(run) {
-  const note = $("#run-note");
-  if (!note || !run) return;
-  note.innerHTML = `<strong>${escapeHtml(run.objective || run.goal_id)}</strong><span class="task-state ${escapeHtml(taskCategory(run))}">${escapeHtml(runStateLabel(run.status))}</span><details class="inline-meta"><summary>任务标识</summary><code>${escapeHtml(run.run_id)}</code><br><code>${escapeHtml(run.spec_digest)}</code></details>`;
-}
 function renderPlanOverview(plan, detail) {
   const host = $("#plan-map");
   if (!host) return;
@@ -2699,11 +2684,8 @@ function renderPlanOverview(plan, detail) {
   }
   if (PLANNING.runId !== MODULE_RUN.id) PLANNING.selected = "";
   PLANNING.runId = MODULE_RUN.id;
-  const lines = layout.edges.map((edge) => {
-    const a = layout.points.get(edge.from), b = layout.points.get(edge.to);
-    const x = a.x + STEP.w, y = a.y + STEP.h / 2, end = b.y + STEP.h / 2;
-    return `<path d="M ${x} ${y} C ${x + STEP.gap / 2} ${y}, ${b.x - STEP.gap / 2} ${end}, ${b.x} ${end}" marker-end="url(#plan-arrow)" />`;
-  }).join("");
+  const lines = layout.edges.filter((edge) => layout.points.get(edge.to).x > layout.points.get(edge.from).x)
+    .map((edge) => `<path d="${dagEdgePath(layout, edge)}" data-plan-from="${escapeHtml(edge.from)}" data-plan-to="${escapeHtml(edge.to)}" marker-end="url(#plan-arrow)" />`).join("");
   host.innerHTML = `${layout.cyclic || layout.missing.length ? '<p class="alert">计划存在循环或缺失依赖，请检查规格。</p>' : ""}<div class="plan-canvas" style="width:${layout.width}px;height:${layout.height}px"><svg aria-hidden="true" width="${layout.width}" height="${layout.height}"><defs><marker id="plan-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" /></marker></defs>${lines}</svg>${models.map((m) => {
     const point = layout.points.get(m.step.node_id);
     return `<button class="plan-node" data-plan-node="${escapeHtml(m.step.node_id)}" style="left:${point.x}px;top:${point.y}px;width:${STEP.w}px;height:${STEP.h}px" aria-pressed="false"><span class="muted">STEP ${String(m.index).padStart(2, "0")} · ${escapeHtml(stateText(m.step.state))}</span><strong>${escapeHtml(m.plan.objective || m.step.node_id)}</strong><span class="muted">${expectationBadge(m.plan) || ((m.plan.deps || []).length ? (m.plan.deps || []).length + " 个前置步骤" : "起始步骤")}</span></button>`;
@@ -2711,7 +2693,17 @@ function renderPlanOverview(plan, detail) {
   const select = (id) => {
     const m = models.find((item) => item.step.node_id === id) || models[0];
     PLANNING.selected = m.step.node_id;
-    $$("[data-plan-node]", host).forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.planNode === m.step.node_id)));
+    const related = new Set([m.step.node_id]);
+    $$("[data-plan-from]", host).forEach((edge) => {
+      const { planFrom, planTo } = edge.dataset;
+      const active = planFrom === m.step.node_id || planTo === m.step.node_id;
+      edge.classList.toggle("related", active);
+      if (active) { related.add(planFrom); related.add(planTo); }
+    });
+    $$("[data-plan-node]", host).forEach((button) => {
+      button.setAttribute("aria-pressed", String(button.dataset.planNode === m.step.node_id));
+      button.classList.toggle("dimmed", !related.has(button.dataset.planNode));
+    });
     const definition = Object.fromEntries(
       Object.entries(m.plan).filter(([key]) => !key.startsWith("expectation"))
     );
@@ -2859,11 +2851,25 @@ function stableHtml(host, markup) {
   host.innerHTML = markup; STABLE_HTML.set(host, markup); return true;
 }
 const WORKFLOW = {
-  run: null, plan: null, specs: null, goal: null, validation: null, runs: [],
+  run: null, plan: null, specs: null, goal: null, validation: null, delivery: null, runs: [],
   draftStage: "task", available: {}, reads: null, pending: null, loadingRun: "", request: 0,
+  view: "task",
 };
 
-function workflowProgress(run, goal = {}, validation = {}, draftStage = "task") {
+function deliveryLabel(delivery) {
+  const labels = {
+    PUBLISHED: "已发布到目标分支",
+    PENDING_CONFIRMATION: "已请求发布 · 未确认",
+    NOT_PUBLISHED: "未发布",
+    EVIDENCE_CONFLICT: "发布收据不一致",
+    NOT_RECORDED: "发布无记录",
+  };
+  const label = labels[delivery?.status] || "无发布证据";
+  return delivery?.status === "PUBLISHED" && delivery.commit
+    ? `${label} · ${delivery.target_branch} · ${shortDigest(delivery.commit)}` : label;
+}
+
+function workflowProgress(run, goal = {}, validation = {}, draftStage = "task", delivery) {
   const states = { task: "active", plan: "waiting", execute: "waiting", audit: "waiting" };
   const labels = { task: "描述目标", plan: "等待需求", execute: "等待确认规划", audit: "等待执行结果" };
   let current = "task", action = "从描述目标开始 ↓";
@@ -2899,56 +2905,92 @@ function workflowProgress(run, goal = {}, validation = {}, draftStage = "task") 
   }
   if (run.status === "COMPLETED") {
     states.execute = "done"; labels.execute = "执行已完成"; current = "audit";
-    states.audit = goalPassed ? "done" : "attention";
-    const latest = (goal.stages || []).slice(-1)[0];
-    labels.audit = goalPassed ? (latest?.scope === "acceptance_only" ? "验收通过 · 查看目标结论" : "目标审计通过") : "执行完成 · 目标待核对";
+    states.audit = delivery?.status === "PUBLISHED" ? "done" : "attention";
+    labels.audit = deliveryLabel(delivery);
     action = "查看审计结果与交付记录 ↓";
+  }
+  if (delivery?.status === "PENDING_CONFIRMATION" || delivery?.status === "EVIDENCE_CONFLICT") {
+    current = "audit"; states.audit = "attention"; labels.audit = deliveryLabel(delivery);
+    action = "查看发布证据与恢复操作 ↓";
   }
   if (failed) {
     current = "audit"; states.execute = "attention"; states.audit = "attention";
-    labels.execute = runStateLabel(run.status); labels.audit = "查看原因与后续处理"; action = "查看本轮结果与恢复操作 ↓";
+    labels.execute = runStateLabel(run.status); labels.audit = deliveryLabel(delivery);
+    action = "查看本轮结果与恢复操作 ↓";
   }
   return { states, labels, current, action };
 }
 
 function renderWorkflowProgress() {
   if (!isWorkflow()) return;
-  const progress = workflowProgress(WORKFLOW.run, WORKFLOW.goal || {}, WORKFLOW.validation || {}, WORKFLOW.draftStage);
+  const progress = workflowProgress(
+    WORKFLOW.run, WORKFLOW.goal || {}, WORKFLOW.validation || {}, WORKFLOW.draftStage, WORKFLOW.delivery,
+  );
   $$("[data-flow-link]").forEach((link) => {
     const stage = link.dataset.flowLink;
     link.dataset.state = progress.states[stage];
-    if (stage === progress.current) link.setAttribute("aria-current", "step"); else link.removeAttribute("aria-current");
+    if (stage === WORKFLOW.view) link.setAttribute("aria-current", "page"); else link.removeAttribute("aria-current");
   });
   $$("[data-flow-status]").forEach((host) => { host.textContent = progress.labels[host.dataset.flowStatus]; });
   for (const [stage, state] of Object.entries(progress.states)) {
     const section = $(`#flow-${stage}`); if (section) section.dataset.state = state;
   }
-  const next = $("#workflow-next");
-  if (next) { next.href = "#flow-" + progress.current; next.textContent = progress.action; }
-  const hint = $("#workflow-loop-hint");
-  if (hint) hint.textContent = Number(WORKFLOW.goal?.active_stage) > 1
-    ? `↺ 正在对照原目标改进 · 第 ${Number(WORKFLOW.goal.active_stage)} / 3 轮`
-    : "↺ 目标偏离后，按反馈进入下一轮执行 · 含首次最多 3 轮";
 }
 
 function updateWorkflowSections() {
   if (!isWorkflow()) return;
   const selected = Boolean(MODULE_RUN.id);
   const show = (id, visible) => { const host = document.getElementById(id); if (host) host.hidden = !visible; };
-  show("workflow-create", !selected); show("workflow-submitted", selected);
+  const reviewing = !selected && WORKFLOW.draftStage === "review";
+  show("workflow-controls", selected);
+  show("workflow-views", selected || reviewing);
+  $("#workflow-views")?.classList.toggle("draft-views", !selected);
+  for (const stage of ["task", "plan", "execute", "audit"]) {
+    show("flow-" + stage, WORKFLOW.view === stage);
+  }
+  for (const link of $$("[data-flow-link]")) {
+    link.hidden = !selected && !["task", "plan"].includes(link.dataset.flowLink);
+  }
+  show("workflow-create", !selected && !(INTAKE.pending && !INTAKE.session));
+  show("workflow-submitted", selected);
   show("workflow-draft-plan", !selected && WORKFLOW.draftStage === "review");
   show("workflow-frozen-plan", selected && WORKFLOW.available.plan);
   show("workflow-plan-empty", selected ? !WORKFLOW.available.plan : WORKFLOW.draftStage !== "review");
   show("workflow-execution", selected && WORKFLOW.available.execute); show("workflow-execute-empty", !selected || !WORKFLOW.available.execute);
   show("workflow-audit", selected && WORKFLOW.available.audit); show("workflow-audit-empty", !selected || !WORKFLOW.available.audit);
   for (const id of ["export-jsonl", "export-csv"]) show(id, selected && WORKFLOW.available.audit);
+  renderWorkflowThread();
 }
 
-function focusWorkflowStage(stage) {
+function focusWorkflowStage(stage, scroll = false) {
+  if (!MODULE_RUN.id && (stage !== "plan" || WORKFLOW.draftStage !== "review")) stage = "task";
   const section = document.getElementById("flow-" + stage);
   if (!section) return;
-  section.scrollIntoView({ block: "start", behavior: "auto" });
-  if (stage === "execute" && WORKFLOW.available.execute) fitGraph();
+  const changed = WORKFLOW.view !== stage;
+  WORKFLOW.view = stage;
+  updateWorkflowSections();
+  renderWorkflowProgress();
+  if (scroll && section.getBoundingClientRect?.().top < 78) {
+    $("#workflow-views")?.scrollIntoView({ block: "start", behavior: "auto" });
+  }
+  if (changed && stage === "execute" && WORKFLOW.available.execute && !WORKSPACE.fitted) {
+    fitGraph(.65); WORKSPACE.fitted = true;
+  }
+}
+
+function renderWorkflowThread() {
+  const host = $("#workflow-thread");
+  if (!host) return;
+  const selected = Boolean(MODULE_RUN.id);
+  const draft = selected && INTAKE.session?.run_id !== MODULE_RUN.id ? null : INTAKE.session;
+  const message = selected ? (draft?.objective || WORKFLOW.plan?.objective || WORKFLOW.run?.objective) : INTAKE.objective;
+  host.hidden = WORKFLOW.view !== "task" || !message;
+  if (host.hidden) return;
+  const turns = (draft?.answers || []).map((answer) => {
+    const question = draft.questions?.find((row) => row.id === answer.question_id);
+    return `<div class="chat-turn"><span class="chat-author">Daedalus</span><p>${escapeHtml(question?.question || answer.field)}</p></div><div class="chat-turn chat-own"><span class="chat-author">你</span><p>${escapeHtml(answer.label)}</p></div>`;
+  }).join("");
+  stableHtml(host, `<div class="chat-turn chat-own"><span class="chat-author">你</span><p>${escapeHtml(message)}</p></div>${turns}${!selected && INTAKE.pending ? `<p class="chat-pending muted" role="status">${escapeHtml(INTAKE.pending)}</p>` : ""}`);
 }
 
 function renderWorkflowSubmitted() {
@@ -2956,10 +2998,17 @@ function renderWorkflowSubmitted() {
   const plan = WORKFLOW.plan || {}, payload = WORKFLOW.specs || {};
   const goal = (payload.specs || []).find((card) => card.key === "spec_01")?.document || {};
   const title = plan.objective || WORKFLOW.run?.objective || WORKFLOW.run?.goal_id || MODULE_RUN.id;
-  const heading = $("#workflow-title"); if (heading) heading.textContent = title;
+  const heading = $("#workflow-title"); if (heading) heading.textContent = ellipsis(title, 110);
   document.title = title + " · Daedalus";
-  const subtitle = $("#workflow-subtitle"); if (subtitle) subtitle.textContent = "沿着同一条流程查看需求、计划、执行与审计，所有记录对应当前任务。";
-  stableHtml($("#workflow-submitted"), `<h3 class="workflow-submitted-title">${escapeHtml(title)}</h3><div class="workflow-goal-facts"><span>目标 ${escapeHtml(plan.goal_id || "—")}</span><span>风险 ${escapeHtml(plan.risk_level || "—")}</span><span>当前任务 <code>${escapeHtml(shortDigest(MODULE_RUN.id, 24))}</code></span></div><details class="secondary-details"><summary>原始目标与验收标准</summary>${renderDocument(goal.acceptance_criteria || goal || [])}</details>`);
+  const subtitle = $("#workflow-subtitle"); if (subtitle) subtitle.textContent = "在对话、规划、执行与审计间切换，按需查看证据。";
+  const steps = WORKFLOW.runs.find((row) => row.run_id === MODULE_RUN.id)?.steps || {};
+  const total = Object.values(steps).reduce((count, value) => count + value, 0);
+  const progress = workflowProgress(WORKFLOW.run || {}, WORKFLOW.goal || {}, WORKFLOW.validation || {}, "", WORKFLOW.delivery);
+  const host = $("#workflow-submitted");
+  const wasOpen = host?.querySelector("details")?.open;
+  const changed = stableHtml(host, `<section class="panel task-overview"><header class="panel-head"><div><span class="eyebrow">任务摘要</span><h2>${escapeHtml(runStateLabel(WORKFLOW.run?.status || "PENDING"))}</h2></div><a class="button ghost small" href="#flow-${progress.current}">${escapeHtml(progress.action.replace(/ ↓$/, " →"))}</a></header><div class="summary-strip">${summaryTiles([["步骤已提交", `${steps.COMMITTED || 0} / ${total}`], ["风险", plan.risk_level || "—"], ["交付", deliveryLabel(WORKFLOW.delivery)]])}</div><details class="secondary-details"><summary>原始验收与任务标识</summary><p><code>${escapeHtml(MODULE_RUN.id)}</code></p>${renderDocument(goal.acceptance_criteria || [])}</details></section>`);
+  if (changed && wasOpen) host.querySelector("details").open = true;
+  renderWorkflowThread();
 }
 
 function renderWorkflowLoop(goal) {
@@ -2989,13 +3038,23 @@ function renderWorkflowLoop(goal) {
   stableHtml(host, `<div class="workflow-loop-head"><div><h3>${escapeHtml(title)}</h3><p>目标偏离时保留审计反馈，再进入新 stage；含首次最多 3 轮。</p></div><a class="button ghost small" href="#flow-execute">↺ 回看执行</a></div><div class="workflow-stage-list">${stageLinks}</div>${feedback ? '<p class="workflow-feedback">改进依据：' + escapeHtml(feedback) + '</p>' : ""}`);
 }
 
+function renderWorkflowHistory() {
+  const host = $("#workflow-history");
+  if (!host) return;
+  const runs = filterTasks(WORKFLOW.runs, $("#history-search")?.value || "", "all");
+  const count = $("#history-count");
+  if (count) count.textContent = String(runs.length);
+  stableHtml(host, runs.map((run) => {
+    const title = run.objective || run.goal_id || run.run_id;
+    const active = run.run_id === MODULE_RUN.id;
+    return `<a class="history-item" href="/execution/${encodeURIComponent(run.run_id)}#flow-task"${active ? ' aria-current="page"' : ""} title="${escapeHtml(title)}"><i class="history-dot ${taskCategory(run)}" aria-hidden="true"></i><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(runStateLabel(run.status))} · ${escapeHtml(timeAgo(run.updated_at || run.created_at))}</small></span></a>`;
+  }).join("") || `<p class="history-empty muted">${WORKFLOW.runs.length ? "未找到匹配任务" : "暂无历史任务"}</p>`);
+}
+
 async function refreshWorkflowRuns() {
   const payload = await api("/api/runs");
   WORKFLOW.runs = (payload.runs || []).slice().reverse();
-  const picker = $("#run-picker"); if (!picker) return;
-  let options = '<option value="">＋ 新建任务</option>' + WORKFLOW.runs.map((run) => `<option value="${escapeHtml(run.run_id)}">${escapeHtml(ellipsis(run.objective || run.goal_id, 38))} · ${escapeHtml(runStateLabel(run.status))}</option>`).join("");
-  if (MODULE_RUN.id && !WORKFLOW.runs.some((run) => run.run_id === MODULE_RUN.id)) options += `<option value="${escapeHtml(MODULE_RUN.id)}">${escapeHtml(shortDigest(MODULE_RUN.id, 24))} · 正在读取</option>`;
-  stableHtml(picker, options); picker.value = MODULE_RUN.id;
+  renderWorkflowHistory();
 }
 
 function loadWorkflow() {
@@ -3012,6 +3071,8 @@ function loadWorkflow() {
     const failures = results.filter((result) => result.status === "rejected");
     showError("#workflow-error", failures.length ? new Error("部分任务信息暂时无法读取，可以刷新重试。已加载的阶段仍可查看。") : null);
     await refreshWorkflowRuns();
+    if (request !== WORKFLOW.request || MODULE_RUN.id !== runId) return;
+    renderWorkflowSubmitted();
     renderWorkflowProgress(); updateWorkflowSections();
   })().catch((error) => { if (MODULE_RUN.id === runId) showError("#workflow-error", error); }).finally(() => {
     if (WORKFLOW.reads === reads) WORKFLOW.reads = null;
@@ -3028,63 +3089,81 @@ async function openWorkflowRun(runId, focus = "") {
     const knowledgeRepo = $("#knowledge-repo"); if (knowledgeRepo) knowledgeRepo.value = "";
     WORKFLOW.request += 1;
     WORKFLOW.run = runId ? (WORKFLOW.runs.find((row) => row.run_id === runId) || {run_id: runId, status: "PENDING"}) : null;
-    WORKFLOW.goal = null; WORKFLOW.validation = null;
+    WORKFLOW.goal = null; WORKFLOW.validation = null; WORKFLOW.delivery = null;
     WORKFLOW.plan = null; WORKFLOW.specs = null; WORKFLOW.available = {}; WORKFLOW.diffKey = "";
     PLANNING.renderKey = ""; VALIDATION_UI.busy = false;
-    const submitted = $("#workflow-submitted"); if (submitted) submitted.textContent = "正在读取任务需求…";
+    const submitted = $("#workflow-submitted"); if (submitted) stableHtml(submitted, '<p class="muted">正在读取任务…</p>');
     const title = $("#workflow-title"); if (title && runId) title.textContent = WORKFLOW.run?.objective || WORKFLOW.run?.goal_id || "正在读取任务…";
+    showGraphInspector(false);
+    for (const section of $$(".flow-section details[open]")) section.open = false;
     for (const id of ["workflow-error", "planning-error", "execution-error", "audit-error", "action-out"]) showError("#" + id, null);
   }
   const url = runId ? "/execution/" + encodeURIComponent(runId) : "/";
-  window.history.replaceState({}, "", url + (focus ? "#flow-" + focus : ""));
+  const requested = focus || (runId ? "task" : WORKFLOW.draftStage === "review" ? "plan" : "task");
+  window.history.replaceState({}, "", url + (runId ? "#flow-" + requested : ""));
+  const context = $("#workflow-context"); if (context) context.textContent = runId ? "任务 / 工作区" : "任务 / 新对话";
   if (!runId) {
-    const heading = $("#workflow-title"); if (heading) heading.textContent = "把目标变成可验收的结果";
-    const subtitle = $("#workflow-subtitle"); if (subtitle) subtitle.textContent = "提交需求，确认规划，查看执行，再对照目标审计。所有步骤都在这里。";
+    const heading = $("#workflow-title"); if (heading) heading.textContent = "从一个目标开始";
+    const subtitle = $("#workflow-subtitle"); if (subtitle) subtitle.textContent = "告诉 Daedalus 想改什么，再确认执行计划。";
     const note = $("#run-note"); if (note) note.textContent = "";
-    document.title = "Daedalus · 任务全流程";
+    document.title = "Daedalus · 任务工作台";
   }
-  renderWorkflowProgress(); updateWorkflowSections();
+  renderWorkflowHistory();
+  focusWorkflowStage(requested);
+  if (changed) window.scrollTo?.(0, 0);
   await loadWorkflow();
-  if (focus && MODULE_RUN.id === runId) focusWorkflowStage(focus);
 }
 
 async function initWorkflow() {
   initKnowledge();
   initIntake(); bindWorkspace(); bindAuditViews(); wireDiffMode();
-  const picker = $("#run-picker");
-  if (picker) picker.addEventListener("change", () => void openWorkflowRun(picker.value, picker.value ? "execute" : "task"));
+  $("#history-search")?.addEventListener("input", renderWorkflowHistory);
+  $("#history-toggle")?.addEventListener("click", (event) => {
+    const panel = $("#history-panel");
+    if (!panel) return;
+    const collapsed = panel.classList.toggle("mobile-closed");
+    event.currentTarget.setAttribute("aria-expanded", String(!collapsed));
+  });
   const create = $("#workflow-new");
   if (create) create.addEventListener("click", () => {
-    if (INTAKE.session?.status === "FROZEN") {
-      INTAKE.session = null; INTAKE.specs = []; WORKFLOW.draftStage = "task";
-      const input = $("#intake-objective"); if (input) input.value = "";
-      showIntakeStep("task");
-    }
+    if (INTAKE.pending) return;
+    INTAKE.session = null; INTAKE.specs = []; INTAKE.objective = "";
+    const input = $("#intake-objective"); if (input) input.value = "";
+    const acceptance = $("#intake-requirement-check-id"); if (acceptance) acceptance.value = "";
+    const strict = $("#intake-require-behavior-paths"); if (strict) strict.checked = false;
+    showError("#intake-error", null);
+    showIntakeStep("task");
     void openWorkflowRun("", "task");
+    input?.focus();
   });
   document.addEventListener("click", (event) => {
     if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button > 0) return;
     const link = event.target.closest("a[href]"); if (!link || link.hasAttribute("download") || link.target === "_blank") return;
+    if (INTAKE.pending && link.classList.contains("history-item")) { event.preventDefault(); return; }
     const url = new URL(link.href, window.location.href);
     if (url.origin !== window.location.origin) return;
-    // Native stage anchors scroll within this document; don't reinterpret the
-    // current /execution/<id> pathname as a request to return to execution.
-    if (url.pathname === window.location.pathname && /^#flow-(task|plan|execute|audit)$/.test(url.hash)) return;
+    const stageAnchor = url.hash.match(/^#flow-(task|plan|execute|audit)$/)?.[1];
+    if (url.pathname === window.location.pathname && stageAnchor) {
+      event.preventDefault();
+      if (MODULE_RUN.id) window.history.replaceState({}, "", url.pathname + url.hash);
+      focusWorkflowStage(stageAnchor, true);
+      return;
+    }
     const match = url.pathname.match(/^\/(planning|execution|audit|runs)\/([^/]+)\/?$/);
     if (!match) return;
     event.preventDefault();
-    const stage = url.hash.match(/^#flow-(task|plan|execute|audit)$/)?.[1]
-      || { planning: "plan", execution: "execute", runs: "execute", audit: "audit" }[match[1]];
+    const stage = stageAnchor || { planning: "plan", execution: "execute", runs: "task", audit: "audit" }[match[1]];
     const selected = decodeURIComponent(match[2]);
     if (selected === MODULE_RUN.id) {
       window.history.replaceState({}, "", "/execution/" + encodeURIComponent(selected) + "#flow-" + stage);
       focusWorkflowStage(stage);
     } else void openWorkflowRun(selected, stage);
   });
-  updateWorkflowSections(); renderWorkflowProgress();
-  await loadWorkflow();
   const hash = window.location.hash.match(/^#flow-(task|plan|execute|audit)$/)?.[1];
-  if (hash || MODULE_RUN.id) focusWorkflowStage(hash || document.body.dataset.initialStage || "execute");
+  const context = $("#workflow-context");
+  if (context && MODULE_RUN.id) context.textContent = "任务 / 工作区";
+  focusWorkflowStage(hash || (MODULE_RUN.id ? document.body.dataset.initialStage || "task" : "task"));
+  await loadWorkflow();
   startPolling(loadWorkflow);
   await refreshBadge();
 }

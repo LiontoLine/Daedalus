@@ -477,15 +477,12 @@ class IndependentValidationService:
             except Exception as error:
                 reason = str(error)
         delivered = False
-        delivery = next(
-            (
-                e
-                for e in reversed(self.store.events_for("delivery:" + run_id))
-                if e.event_type == "DeliveryRequested"
-            ),
-            None,
-        )
-        if required and delivery and run["status"] == "COMPLETED":
+        from daedalus.application.delivery_evidence import delivery_events
+
+        delivery, confirmed, conflict = delivery_events(self.store, run) if required else (None, None, False)
+        if conflict:
+            reason = "publication evidence does not match the recorded delivery request"
+        if confirmed and delivery:
             try:
                 self.recorded_delivery(
                     run_id,

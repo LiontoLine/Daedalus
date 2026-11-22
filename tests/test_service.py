@@ -540,7 +540,7 @@ def test_the_console_renders_every_page(service) -> None:
             stages = ['id="flow-' + name + '"' for name in ("task", "plan", "execute", "audit")]
             assert [response.text.index(stage) for stage in stages] == sorted(response.text.index(stage) for stage in stages)
             assert 'data-page="workflow"' in response.text
-            assert response.text.count('id="run-picker"') == 1
+            assert response.text.count('id="workflow-history"') == 1
             assert response.text.count('id="refresh"') == 1
         # Same-origin assets, so there is no CORS surface and no second deployment.
         assert "/static/console.css" in response.text

@@ -13,14 +13,16 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from daedalus.application.requirement_evidence import (
+    MAX_PATH_STEPS,
+    load_qualification,
+    public_behavior_paths,
     qualify,
     seal,
     validate_contract,
-    validate_qualification,
 )
 from daedalus.domain.ids import new_id, utc_now
 from daedalus.domain.spec import BoundarySpec
-from daedalus.infrastructure.git_sandbox import GitSandbox, _git
+from daedalus.errors import DaedalusError
 from daedalus.infrastructure.knowledge import atomic_json
 from daedalus.infrastructure.repository_lock import repository_lock
 from daedalus.infrastructure.sandbox import SeatbeltDriver
@@ -38,6 +40,17 @@ class BehaviorCheck(BaseModel):
     test_name: str = Field(min_length=1, max_length=85)
     requirement_id: str = Field(min_length=1, max_length=64)
     role: str = Field(pattern=r"^(change|invariant)$")
+    path_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class BehaviorPath(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=64)
+    requirement_id: str = Field(min_length=1, max_length=64)
+    role: Literal["change", "invariant"]
+    entry: str = Field(min_length=1, max_length=240)
+    steps: list[str] = Field(min_length=1, max_length=MAX_PATH_STEPS)
+    outcome: str = Field(min_length=1, max_length=240)
 
 
 class RequirementRequest(BaseModel):
@@ -47,6 +60,8 @@ class RequirementRequest(BaseModel):
     target_paths: list[str] = Field(min_length=1, max_length=12)
     requirements: list[Requirement] = Field(min_length=1, max_length=12)
     checks: list[BehaviorCheck] = Field(min_length=1, max_length=12)
+    behavior_paths: list[BehaviorPath] | None = Field(default=None, max_length=12)
+    repair_path: str | None = Field(default=None, min_length=1, max_length=512)
     source: str = Field(min_length=1, max_length=16000)
     open_questions: list[str] = Field(default_factory=list, max_length=5)
     confirm_operator_tests: StrictBool = False
@@ -59,24 +74,21 @@ def directory(state, check_id):
 
 
 def load_ready(state, check_id, repo, objective, targets):
-    target = directory(state, check_id)
+    directory(state, check_id)  # preserve the public 404 for malformed identities
     try:
-        job = json.loads((target / "job.json").read_text())
-        proof = json.loads((target / "report.json").read_text())
-        contract = json.loads((target / "contract.json").read_text())
-        if job["status"] != "READY":
-            raise ValueError("requirement check is not ready for repair")
-        validate_qualification(contract, proof)
-        if (proof["repo_path"] != str(repo.resolve()) or contract["objective"] != objective
-                or set(proof["target_paths"]) != set(targets)
-                or GitSandbox.main_commit(repo) != proof["base_commit"]
-                or _git(repo, ["status", "--porcelain", "--untracked-files=all"], check=True)
-                .stdout.strip()):
-            raise ValueError("requirement check is stale or belongs to another request")
-        return contract, proof
-    except (OSError, ValueError, KeyError, TypeError):
+        return load_qualification(state.settings.workspace.root_path, check_id, repo, objective, targets)
+    except (DaedalusError, OSError, ValueError, KeyError, TypeError, SyntaxError):
         raise HTTPException(409, "a matching READY requirement check on the current clean base "
                             "is required") from None
+
+
+def _require_local_operator(state, request: Request) -> None:
+    if (state.settings.service.host not in {"localhost", "127.0.0.1", "::1", "[::1]"}
+            or request.headers.get("x-daedalus-requirements") != "1"):
+        raise HTTPException(403, "requirement checks need an explicit local operator action")
+    origin = request.headers.get("origin")
+    if origin and origin != str(request.base_url).rstrip("/"):
+        raise HTTPException(403, "cross-origin requirement check refused")
 
 
 def requirement_router(state):
@@ -84,20 +96,21 @@ def requirement_router(state):
 
     @router.post("/api/requirement-checks", status_code=202)
     def create(request: Request, body: RequirementRequest):
-        if (state.settings.service.host not in {"localhost", "127.0.0.1", "::1", "[::1]"}
-                or request.headers.get("x-daedalus-requirements") != "1"):
-            raise HTTPException(403, "requirement checks need an explicit local operator action")
-        origin = request.headers.get("origin")
-        if origin and origin != str(request.base_url).rstrip("/"):
-            raise HTTPException(403, "cross-origin requirement check refused")
+        _require_local_operator(state, request)
         if not body.confirm_operator_tests:
             raise HTTPException(422, "operator-frozen tests must be explicitly confirmed")
-        contract = seal({"version": 1, "objective": body.objective,
+        paths = body.behavior_paths
+        contract = seal({"version": 2 if paths is not None else 1, "objective": body.objective,
                          "requirements": [r.model_dump() for r in body.requirements],
-                         "checks": [c.model_dump() for c in body.checks], "source": body.source,
-                         "open_questions": body.open_questions})
+                         "checks": [c.model_dump(exclude_none=True) for c in body.checks],
+                         "source": body.source, "open_questions": body.open_questions,
+                         **({"behavior_paths": [p.model_dump() for p in paths]}
+                            if paths is not None else {}),
+                         **({"repair_path": body.repair_path} if body.repair_path is not None else {})})
         try:
             validate_contract(contract)
+            if body.repair_path is not None and body.repair_path not in body.target_paths:
+                raise ValueError("repair_path must be a frozen target path")
         except (ValueError, TypeError, SyntaxError, SecretInPayload):
             raise HTTPException(422, "behavior contract is invalid; "
                                 "input source is not echoed") from None
@@ -115,6 +128,7 @@ def requirement_router(state):
         job = {"check_id": check_id, "status": "QUEUED", "created_at": utc_now(),
                "session_id": state.lifecycle.session_id, "automatic_resume": False,
                "model_calls": 0,
+               "contract_version": contract["version"],
                "contract_sha256": contract["sha256"]}
         atomic_json(target / "contract.json", contract)
         atomic_json(target / "job.json", job)
@@ -134,13 +148,15 @@ def requirement_router(state):
             atomic_json(target / "job.json", job)
             return SimpleNamespace(status=job["status"])
 
+        accepted = {**job, **({"behavior_paths": public_behavior_paths(contract, {})}
+                            if paths is not None else {})}
         try:
             state.dispatcher.submit(check_id, str(repo), execute)
         except Exception:
             job.update(status="ADMISSION_FAILED", finished_at=utc_now())
             atomic_json(target / "job.json", job)
             raise
-        return dict(job)
+        return accepted
 
     @router.get("/api/requirement-checks/{check_id}")
     def view(check_id: str):
@@ -151,12 +167,25 @@ def requirement_router(state):
         if (job["status"] in {"QUEUED", "RUNNING"}
                 and job["session_id"] != state.lifecycle.session_id):
             job.update(status="INTERRUPTED", automatic_resume=False)
-        if (target / "report.json").is_file():
-            job["report"] = json.loads((target / "report.json").read_text())
+        report = json.loads((target / "report.json").read_text()) if (target / "report.json").is_file() else {}
+        baseline = report.get("baseline", {})
+        if report:
+            job["report"] = {
+                "decision": report["decision"],
+                "proof_sha256": report["sha256"],
+                "base_commit": report["base_commit"],
+                "base_tree": report["base_tree"],
+                "baseline": {key: baseline[key] for key in ("complete", "passed", "executed")
+                             if key in baseline},
+            }
+        if job.get("contract_version") == 2:
+            contract = json.loads((target / "contract.json").read_text())
+            job["behavior_paths"] = public_behavior_paths(contract, baseline)
         return job
 
     @router.get("/api/requirement-checks/{check_id}/artifacts/{name}")
-    def artifact(check_id: str, name: Literal["report.json", "contract.json"]):
+    def artifact(request: Request, check_id: str, name: Literal["report.json", "contract.json"]):
+        _require_local_operator(state, request)
         target = directory(state, check_id) / name
         if not target.is_file():
             raise HTTPException(404, "requirement artifact not found")

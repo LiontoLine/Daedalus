@@ -28,6 +28,22 @@ def test_named_function_past_old_prefix_is_visible_and_source_lines_exact():
     assert source_view("small\n", "parser") == "small\n"
 
 
+@pytest.mark.parametrize(("query", "focal_query", "expected"), [
+    ("nothing_matches", "also_missing", "recover_state"),
+    ("normal_state", "also_missing", "normal_state"),
+    ("normal_state", "focus_state", "focus_state"),
+])
+def test_source_window_retains_explicit_fallback_without_changing_focus_order(query, focal_query, expected):
+    names = ("recover_state", "normal_state", "focus_state")
+    text = ("# unrelated padding\n" * 500).join(
+        f"\n\ndef {name}():\n    return 42\n" for name in names
+    )
+    view = source_view(text, query, focal_query=focal_query, fallback_query="recover_state")
+    assert f"def {expected}():\n    return 42\n" in view
+    assert not any(f"def {name}(" in view for name in names if name != expected)
+    assert len(view) <= 8000
+
+
 def test_named_class_includes_behavior_defining_attributes_inside_same_context_limit():
     target = (
         "class String(Token):\n    __slots__ = ('text',)\n"
@@ -297,3 +313,151 @@ def test_repair_memory_marks_omissions_and_does_not_turn_review_claims_into_exec
         assert len(records) <= 8
     finally:
         owner.store.close()
+
+
+def test_new_inspection_does_not_reopen_semantic_review_of_an_unchanged_candidate(
+    git_repo, tmp_path,
+):
+    import json
+
+    from daedalus.application.gatekeeper.tier2 import Tier2Gate
+    from daedalus.application.orchestrator import RunOrchestrator
+    from daedalus.application.planner import DeterministicPlanner, PlanRequest
+    from daedalus.infrastructure.git_sandbox import _git
+    from tests.conftest import TEST_COMMAND
+
+    compliant = CORRECT_IMPLEMENTATION
+    incomplete = compliant.replace("ACCEPTED_IMPLEMENTATION = True", "ACCEPTED_IMPLEMENTATION = False")
+    original = _git(git_repo, ["rev-parse", "main"], check=True).stdout.strip()
+    bundle = DeterministicPlanner().plan(PlanRequest(
+        request_id="same-patch-review",
+        goal_id="textstats",
+        objective="Fix word counting and set the accepted implementation marker to True.",
+        target_paths=(TARGET,),
+        test_command=TEST_COMMAND,
+    ))
+    attempts = []
+    reviewed_attempts = []
+
+    class Worker:
+        name = "offline-candidate-worker"
+
+        def implement(self, sandbox, context):
+            attempts.append(context)
+            sandbox.write_file(TARGET, compliant if context.attempt == 3 else incomplete)
+            extra = {}
+            if context.attempt == 2:
+                request = InspectionRequest.parse({
+                    "tool": "read", "path": TARGET, "line": 1, "gap": "Inspect the marker and source",
+                })
+                receipt = RepositoryInspector()(sandbox, context, request).receipt
+                extra["inspection_receipts"] = [receipt]
+            return WorkerResult(ok=True, changed_files=(TARGET,), extra=extra)
+
+    class Reviewer:
+        def complete(self, prompt, *, subject_digest):
+            reviewed_attempts.append(attempts[-1].attempt)
+            accepted = "+ACCEPTED_IMPLEMENTATION = True\n" in prompt
+            return json.dumps({
+                "decision": "APPROVE" if accepted else "REVISE",
+                "subject_digest": subject_digest,
+                "reasons": ["The marker is set"] if accepted else ["The marker is not set"],
+                "violations": [] if accepted else ["Set the accepted implementation marker to True"],
+                "confidence": 0.9,
+            })
+
+    with EventStore(tmp_path / "same-patch-review.db") as store:
+        owner = RunOrchestrator(
+            store=store, repo_path=git_repo, run_root=tmp_path / "runs", bundle=bundle,
+            worker=Worker(), tier2=Tier2Gate(reviewer=Reviewer()), retry_backoff_sec=0,
+        )
+        owner.register_spec()
+        result = owner.run()
+
+        assert [context.attempt for context in attempts] == [1, 2, 3]
+        assert all(context.base_commit == original and context.bundle == bundle
+                   and context.node == bundle.plan.nodes[0] for context in attempts)
+        events = store.events_for_execution(owner.execution_id)
+        observed = [event.payload for event in events
+                    if event.event_type == "WorkerEngineeringObserved"]
+        assert len(observed) == 1 and observed[0]["attempt"] == 2
+        receipt, = observed[0]["inspection_receipts"]
+        assert receipt["status"] == "found" and TARGET in receipt["sources"]
+        failures = [event.payload for event in events if event.event_type == "TrunkNodeFailed"]
+        assert [(row["attempt"], row["error_code"]) for row in failures] == [
+            (1, "semantic_revision"), (2, "repeated_rejected_candidate"),
+        ]
+        assert failures[0]["patch_digest"] == failures[1]["patch_digest"]
+        assert reviewed_attempts == [1, 3]
+        assert sum(event.event_type == "StepGatekeeperEntered" for event in events) == 2
+        assert [event.payload["reviewer_decision"] for event in events
+                if event.event_type == "StepTier2Decided"] == ["REVISE", "APPROVE"]
+        assert result.status == "COMPLETED" and result.promoted_commit, result.describe()
+        assert _git(git_repo, ["rev-parse", "main"], check=True).stdout.strip() == result.promoted_commit
+        assert _git(git_repo, ["show", f"main:{TARGET}"], check=True).stdout == compliant
+
+
+@pytest.mark.parametrize("same_spec", [True, False])
+def test_explicit_replay_carries_native_failure_only_for_frozen_subject(
+    git_repo, tmp_path, same_spec,
+):
+    from daedalus.application.coding_worker import FileOp, ScriptedWorker
+    from daedalus.application.gatekeeper.tier2 import Tier2Gate
+    from daedalus.application.worker_factory import build_model_worker
+    from tests.conftest import TEST_COMMAND
+    from tests.test_worker_checks import python_command
+    from tests.test_goal_audit import GoalReviewer
+
+    anchor = "EXPECTED_CONSUMER_WORDS = 2"
+    commit(git_repo, **{"public_consumer.py": (
+        "import sys\nsys.path.insert(0, 'src')\n"
+        "from example_project.textstats import summarize\n"
+        f"{anchor}\n"
+        "print('runtime context ' * 30)\n"
+        "assert summarize('one two')['words'] == EXPECTED_CONSUMER_WORDS, 'actual count ' * 85\n"
+    )})
+    bad = CORRECT_IMPLEMENTATION.replace('"words": len(tokens)', '"words": -1')
+    source = make_owner(
+        git_repo, tmp_path, worker=ScriptedWorker(ops=(FileOp("write", TARGET, content=bad),)),
+    )
+    source.goal_audit_enabled = False  # Default SDK admission still records native constraints.
+    node = source.bundle.plan.nodes[0]
+    node = replace(node, retry_policy=replace(node.retry_policy, max_attempts=1))
+    command = python_command("import runpy; runpy.run_path('public_consumer.py', run_name='__main__')")
+    criteria = tuple(replace(c, command=command) if c.command == TEST_COMMAND else c
+                     for c in source.bundle.goal.acceptance_criteria)
+    source.bundle = replace(
+        source.bundle, goal=replace(source.bundle.goal, acceptance_criteria=criteria),
+        plan=replace(source.bundle.plan, nodes=(node,)),
+    )
+    source.register_spec()
+    first = source.run()
+    assert first.status == "FAILED"
+    base = source.store.get_run(first.run_id)["base_commit"]
+    assert GitSandbox.main_commit(git_repo) == base
+    source.store.close()
+
+    coder = Controller([{
+        "operations": [{"op": "write", "path": TARGET, "content": CORRECT_IMPLEMENTATION}],
+    }])
+    bundle = source.bundle if same_spec else replace(
+        source.bundle, goal=replace(source.bundle.goal, objective="Repair count behavior and keep the API"),
+    )
+    reviewer = GoalReviewer(["APPROVE"])
+    reviewer.criteria = [c.criterion_id for c in bundle.goal.acceptance_criteria]
+    with EventStore(tmp_path / "audit.db") as store:
+        replay = replace(
+            source, store=store, bundle=bundle, worker=build_model_worker(coder),
+            tier2=Tier2Gate(reviewer=reviewer),
+            goal_audit_enabled=True,
+            run_id="", execution_id="", run_root=tmp_path / "replay",
+            parent_execution_id=first.execution_id, replay_from_commit=base,
+        )
+        replay.register_spec()
+        result = replay.run()
+        assert result.status == "COMPLETED", result.describe()
+        text = "\n".join(message.content for message in coder.calls[0])
+        assert (first.execution_id in text) == same_spec
+        assert ('"evidence_kind":"executed_check_failure"' in text) == same_spec
+        assert (anchor in text) == same_spec
+        assert (git_repo / TARGET).read_text() == CORRECT_IMPLEMENTATION

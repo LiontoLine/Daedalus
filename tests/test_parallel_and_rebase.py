@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -296,14 +297,61 @@ def test_quota_one_keeps_execution_serial(git_repo, tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_steps_rebase_onto_the_run_branch(git_repo, tmp_path) -> None:
+@pytest.mark.parametrize("owned, launch_blocked", [(False, False), (True, False), (False, True)])
+def test_concurrent_steps_rebase_onto_the_run_branch(git_repo, tmp_path, owned, launch_blocked, monkeypatch):
     """Two steps prepared at the same commit: the second must rebase and be re-gated."""
     repo = _prepare_two_module_repo(tmp_path, git_repo)
     bundle = _bundle(_nodes(), whitelist=(TARGET, EXTRA))
+    if owned:
+        # Scoped gates must review the rebased node's changes, not its sibling's commit.
+        whole = AcceptanceCriterion("whole-project", AssertionKind.EXIT_CODE, command=TEST_COMMAND)
+        bundle = replace(
+            bundle,
+            goal=replace(bundle.goal, acceptance_criteria=(whole,)),
+            plan=replace(bundle.plan, integrated_acceptance=True, nodes=tuple(
+                replace(node, retry_policy=RetryPolicy(max_attempts=1))
+                for node in bundle.plan.nodes
+            )),
+        )
+    refused = []
+    original = GitSandbox.main_commit(repo)
+    if launch_blocked:
+        import errno
+
+        from daedalus.infrastructure.sandbox import HostProcessDriver
+
+        bundle = replace(bundle, boundary=replace(bundle.boundary, isolation="host-process"))
+        run = HostProcessDriver.run
+
+        def fail_rebased_launch(driver, *, worktree, command, timeout_sec, boundary):
+            if (list(command[:2]) == ["/bin/sh", "-c"]
+                    and command[2:] and command[2] in {TEXTSTATS_TESTS.command, EXTRA_TESTS.command}
+                    and _git(worktree, ["rev-parse", "HEAD"], check=True).stdout.strip() != original):
+                refused.append(command[2])
+                raise OSError(errno.EAGAIN, "process allocation refused")
+            return run(driver, worktree=worktree, command=command,
+                       timeout_sec=timeout_sec, boundary=boundary)
+
+        monkeypatch.setattr(HostProcessDriver, "run", fail_rebased_launch)
     worker = _BarrierWorker({TARGET: CORRECT_IMPLEMENTATION, EXTRA: EXTRA_FIXED}, parties=2)
     store, result = _run(repo, tmp_path, bundle, worker, parallel=2)
+    if launch_blocked:
+        try:
+            assert result.status == "PARTIAL_FAILURE" and result.committed_count == 1
+            assert not result.promoted_commit and GitSandbox.main_commit(repo) == original
+            assert worker.arrived == 2 and len(refused) == 1
+            events = store.events_for_execution(result.execution_id)
+            assert any(event.event_type == "RunRebaseRequired" for event in events)
+            failure, = [event.payload for event in events if event.event_type == "StepExecutionFailed"]
+            assert failure["error_code"] == "execution_environment_unavailable"
+            assert failure["recoverable"] is False and failure["branch_retryable"] is False
+        finally:
+            store.close()
+        return
 
     assert result.status == "COMPLETED"
+    if owned:
+        assert result.promoted_commit and result.goal_audit["status"] == "APPROVE"
     event_types = [event.event_type for event in store.all_events()]
     assert "RunRebaseRequired" in event_types, (
         "the second step landed on a run branch that had already moved, so a rebase "

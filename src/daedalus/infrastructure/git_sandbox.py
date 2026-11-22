@@ -430,27 +430,9 @@ class GitSandbox:
         branch's current value, so a concurrent advance fails loudly instead of being
         silently overwritten.
         """
-        commit = self.head()
-        current = self.main_head(target_branch) if self.branch_exists(target_branch) else ""
-        if current == commit:
-            return commit
-        if not current:
-            _git(self.repo_path, ["branch", target_branch, commit], check=True)
-            return commit
-        if not _is_ancestor_of(self.worktree_path, current, commit):
-            raise CommitConflict(
-                f"commit {commit[:12]} does not descend from {target_branch} "
-                f"{current[:12]}; a rebase and re-gate is required",
-                target=target_branch,
-                branch_commit=current,
-                worktree_commit=commit,
-            )
-        _git(
-            self.repo_path,
-            ["update-ref", f"refs/heads/{target_branch}", commit, current],
-            check=True,
+        return fast_forward_branch(
+            self.repo_path, target_branch, self.head(), allow_create=True
         )
-        return commit
 
     def integrate(self, target_branch: str, message: str) -> str:
         """Fast-forward the target branch onto this worktree's HEAD.
@@ -462,25 +444,7 @@ class GitSandbox:
         advancement of the target branch a compare-and-swap failure rather than a
         silent overwrite.
         """
-        commit = self.head()
-        current = self.main_head(target_branch)
-        if current == commit:
-            return commit
-        if not _is_ancestor_of(self.worktree_path, current, commit):
-            raise CommitConflict(
-                f"the worktree commit {commit[:12]} does not descend from "
-                f"{target_branch} {current[:12]}; a rebase and re-gate is required "
-                "instead of overwriting history",
-                target=target_branch,
-                main_commit=current,
-                worktree_commit=commit,
-            )
-        _git(
-            self.repo_path,
-            ["update-ref", f"refs/heads/{target_branch}", commit, current],
-            check=True,
-        )
-        return commit
+        return fast_forward_branch(self.repo_path, target_branch, self.head())
 
     # ---------------------------------------------------------------- process
     def run(
@@ -539,6 +503,180 @@ class GitSandbox:
         _git(self.repo_path, ["branch", "-D", self.branch], check=False)
         _git(self.repo_path, ["worktree", "prune"], check=False)
         self._created = False
+
+
+def fast_forward_branch(
+    repo_path: str | Path,
+    target_branch: str,
+    new_commit: str,
+    *,
+    expected_old: str | None = None,
+    allow_create: bool = False,
+) -> str:
+    """Deliver an exact commit without overwriting a caller's checkout.
+
+    A checked-out target uses Git's two-tree fast-forward checkout while a prepared
+    ref transaction holds the expected-old lock. Unlike a reset, read-tree -m -u
+    refuses local and untracked collisions. An explicit untracked-path check also
+    protects ignored data across Git versions. Other worktrees are never modified.
+    Filesystem writes and ref commit are not crash-atomic: an interrupted checkout
+    must be inspected.
+    """
+    repo = Path(repo_path).resolve()
+    options = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+
+    def git(args: list[str], *, check: bool = True) -> CommandResult:
+        return _git(repo, [*options, *args], check=check)
+
+    ref = target_branch
+    if ref != "HEAD" and not ref.startswith("refs/"):
+        ref = f"refs/heads/{ref}"
+    symbolic = git(["symbolic-ref", "--quiet", ref], check=False)
+    if symbolic.ok:
+        ref = symbolic.stdout.strip()
+    if not ref.startswith("refs/heads/") or not git(
+        ["check-ref-format", ref], check=False
+    ).ok:
+        raise GitError(f"handoff requires a branch ref: {target_branch}")
+    commit = git(
+        ["rev-parse", "--verify", "--end-of-options", f"{new_commit}^{{commit}}"]
+    ).stdout.strip()
+    resolved = git(["rev-parse", "--verify", "--quiet", ref], check=False)
+    current = resolved.stdout.strip() if resolved.ok else ""
+    if expected_old is not None and current not in {expected_old, commit}:
+        raise CommitConflict(
+            f"target {target_branch} moved before handoff; promotion refused",
+            expected_old=expected_old, target_commit=current,
+        )
+    if not current and not allow_create:
+        raise GitError(f"handoff target {target_branch} does not exist")
+    if current and not _is_ancestor_of(repo, current, commit):
+        raise CommitConflict(
+            f"target {target_branch} diverged from {commit[:12]}; "
+            "a rebase and re-gate is required",
+            target=target_branch, branch_commit=current, worktree_commit=commit,
+        )
+
+    bare = git(["rev-parse", "--is-bare-repository"]).stdout.strip() == "true"
+    own_root = None if bare else Path(
+        git(["rev-parse", "--show-toplevel"]).stdout.strip()
+    ).resolve()
+    checked_out_here = False
+    for record in git(["worktree", "list", "--porcelain", "-z"]).stdout.split("\0\0"):
+        fields = record.split("\0")
+        worktree = next((item[9:] for item in fields if item.startswith("worktree ")), "")
+        branch = next((item[7:] for item in fields if item.startswith("branch ")), "")
+        if not branch:
+            continue
+        actual = git(["symbolic-ref", "--quiet", branch], check=False)
+        if (actual.stdout.strip() if actual.ok else branch) != ref:
+            continue
+        if own_root is None or Path(worktree).resolve() != own_root:
+            raise CommitConflict(
+                f"target {target_branch} is checked out in another worktree; "
+                "handoff refused",
+                target=target_branch, worktree=worktree,
+            )
+        checked_out_here = True
+
+    if not checked_out_here:
+        # Suppressing hooks also covers reference-transaction hooks on CAS updates.
+        git(["update-ref", ref, commit, current or "0" * len(commit)])
+    else:
+        if not current:
+            raise GitError("cannot hand off an unborn checked-out branch")
+        _checkout_fast_forward(repo, options, ref, current, commit)
+    actual = git(["rev-parse", "--verify", ref]).stdout.strip()
+    if actual != commit:
+        raise CommitConflict(
+            f"target {target_branch} changed during handoff; delivery not confirmed",
+            expected_commit=commit, target_commit=actual,
+        )
+    return commit
+
+
+def _checkout_fast_forward(
+    repo: Path, options: list[str], ref: str, old: str, new: str,
+) -> None:
+    """Lock the CAS before touching files; never reset or discard local data."""
+    env = dict(os.environ)
+    env.update(DEFAULT_GIT_ENV)
+    transaction = subprocess.Popen(
+        ["git", *options, "update-ref", "--stdin"],
+        cwd=str(repo), env=env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    committed = False
+    try:
+        assert transaction.stdin is not None and transaction.stdout is not None
+        transaction.stdin.write(f"start\nupdate {ref} {new} {old}\nprepare\n")
+        transaction.stdin.flush()
+        if (
+            transaction.stdout.readline() != "start: ok\n"
+            or transaction.stdout.readline() != "prepare: ok\n"
+        ):
+            raise CommitConflict("target moved or is locked; handoff refused")
+        branch = _git(repo, [*options, "symbolic-ref", "--quiet", "HEAD"], check=False)
+        if not branch.ok or branch.stdout.strip() != ref:
+            raise CommitConflict("checked-out branch changed during handoff; refused")
+        dirty = _git(
+            repo,
+            [*options, "status", "--porcelain", "--untracked-files=no",
+             "--ignore-submodules=none"],
+            check=True,
+        )
+        if dirty.stdout.strip():
+            raise CommitConflict(
+                "target checkout has pending tracked changes; handoff refused"
+            )
+        changed = set(_git(
+            repo,
+            [*options, "diff", "--name-only", "--no-ext-diff", "--no-renames",
+             "--diff-filter=ACMRT", "-z", old, new, "--"],
+            check=True,
+        ).stdout.split("\0")) - {""}
+        parents = {
+            path[:offset]
+            for path in changed
+            for offset, character in enumerate(path)
+            if character == "/"
+        }
+        # No exclude rules: ls-files must include ignored files as well. Check
+        # file/directory prefix collisions, not just equal pathname strings.
+        untracked = _git(repo, [*options, "ls-files", "--others", "-z"], check=True)
+        for path in untracked.stdout.split("\0"):
+            if not path:
+                continue
+            if (
+                path in changed or path in parents
+                or any(
+                    path[:offset] in changed
+                    for offset, character in enumerate(path) if character == "/"
+                )
+            ):
+                raise CommitConflict(
+                    "target checkout has conflicting untracked or ignored data; "
+                    "handoff refused"
+                )
+        # Even old == new must pass cleanliness checks; a ref-only prior handoff
+        # can leave a stale/dirty checkout and is not proof of usable delivery.
+        _git(
+            repo, [*options, "read-tree", "-m", "-u", old, new], check=True
+        )
+        transaction.stdin.write("commit\n")
+        transaction.stdin.flush()
+        if transaction.stdout.readline() != "commit: ok\n":
+            raise GitError("handoff ref transaction failed after checkout")
+        committed = True
+    finally:
+        if not committed and transaction.poll() is None:
+            try:
+                assert transaction.stdin is not None
+                transaction.stdin.write("abort\n")
+                transaction.stdin.flush()
+            except BrokenPipeError:
+                pass
+        transaction.communicate()
 
 
 def _git(cwd: Path, args: list[str], *, check: bool) -> CommandResult:

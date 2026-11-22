@@ -264,3 +264,77 @@ def test_model_failure_never_retries_unknown_or_terminal_provider_usage(
         )
     finally:
         owner.store.close()
+
+
+def test_step_retry_cannot_promote_an_existing_out_of_boundary_declared_artifact(
+    git_repo, tmp_path,
+):
+    outside = "outside/user_data.txt"
+    original_text = "user-owned content\n"
+    (git_repo / outside).parent.mkdir()
+    (git_repo / outside).write_text(original_text)
+    _git(git_repo, ["add", outside], check=True)
+    _git(git_repo, ["commit", "-m", "preserve out-of-scope user data"], check=True)
+    original = _git(git_repo, ["rev-parse", "main"], check=True).stdout.strip()
+    notes = git_repo / "user-notes.txt"
+    notes.write_text("untracked user notes\n")
+    calls = []
+
+    class Worker:
+        name = "unauthorized-step-repair"
+
+        def implement(self, sandbox, context):
+            calls.append(context)
+            if context.attempt == 1:
+                return WorkerResult(ok=False, error="invalid_edit_plan", summary="stale edit")
+            return ScriptedWorker(ops=(
+                FileOp("write", TARGET, CORRECT_IMPLEMENTATION),
+                FileOp("write", outside, "overwritten by repair\n"),
+            )).implement(sandbox, context)
+
+    owner = make_owner(git_repo, tmp_path, worker=Worker())
+    node = owner.bundle.plan.nodes[0]
+    owner.bundle = replace(owner.bundle, plan=replace(owner.bundle.plan, nodes=(
+        replace(node, expected_artifacts=(*node.expected_artifacts, outside)),
+    )))
+    owner.register_spec()
+    frozen = owner.bundle.to_dict()
+    try:
+        result = owner.run()
+        assert result.status == "FAILED", result.describe()
+        assert len(calls) == 1
+        assert not branch_events(owner, "RepairBranchStarted")
+        assert not branch_events(owner, "RepairBranchPromoted")
+        assert not pending_validation(owner.store, owner.run_id)
+        assert not result.promoted_commit
+        failures = branch_events(owner, "StepExecutionFailed")
+        assert failures[-1]["error_code"] == "boundary_violation"
+        assert failures[-1]["branch_retryable"] is False
+        assert owner.bundle.to_dict() == frozen
+        assert _git(git_repo, ["rev-parse", "main"], check=True).stdout.strip() == original
+        assert _git(git_repo, ["show", f"main:{outside}"], check=True).stdout == original_text
+        assert (git_repo / outside).read_text() == original_text
+        assert notes.read_text() == "untracked user notes\n"
+    finally:
+        owner.store.close()
+
+
+def test_nested_whitelist_step_repair_stays_narrow_and_delivers(git_repo, tmp_path):
+    worker = RepairWorker()
+    owner = make_owner(git_repo, tmp_path, worker=worker)
+    owner.bundle = replace(
+        owner.bundle, boundary=replace(owner.bundle.boundary, fs_whitelist=("src/**",)),
+    )
+    owner.register_spec()
+    frozen = owner.bundle.to_dict()
+    try:
+        result = owner.run()
+        assert result.status == "COMPLETED", result.describe()
+        assert len(worker.contexts) == 2
+        assert worker.contexts[0].bundle.boundary.fs_whitelist == ("src/**",)
+        assert worker.contexts[1].bundle.boundary.fs_whitelist == (TARGET,)
+        assert len(branch_events(owner, "RepairBranchPromoted")) == 1
+        assert _git(git_repo, ["show", f"main:{TARGET}"], check=True).stdout == CORRECT_IMPLEMENTATION
+        assert owner.bundle.to_dict() == frozen
+    finally:
+        owner.store.close()

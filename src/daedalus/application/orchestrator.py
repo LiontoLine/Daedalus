@@ -7,10 +7,10 @@ whole design in miniature:
           -> integrate into the run branch (rebase + re-gate if it moved) -> promote
 
 Concurrency model (Spec §6.4). The control plane is **single-threaded**; only the
-untrusted worker runs concurrently. Leases, worktrees, gates, commits and integration
-all happen on this thread, in a fixed order, so every Git and SQLite mutation is
-deterministic no matter how many steps are in flight. This is the architecture's core
-claim applied to its own execution: an uncertain plane wrapped in a certain one.
+untrusted worker runs concurrently. Leases, gates, managed refs, commits, integration
+and workflow projections remain on this thread. Workers may edit their isolated files
+and stage private indexes to capture immutable observation trees, never advance refs
+or decide acceptance.
 
 Integration model (Spec §11.2). Steps integrate into a **run branch**, not into the
 authoritative branch. Independent steps therefore all branch from the same integration
@@ -27,15 +27,21 @@ landing work whose evidence no longer describes the tree it would land on.
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
 from daedalus.application.approvals import ApprovalService, execution_authorization_required
 from daedalus.application.artifact_cache import ArtifactCache, ReuseKey, reuse_key_for
 from daedalus.application.execution_log import execution_log_ref
+from daedalus.application.coding_worker import (
+    safe_engineering_diagnosis,
+    safe_engineering_observations,
+)
 from daedalus.application.inspection import safe_receipts
 from daedalus.application.source_context import failure_excerpt
 from daedalus.application.fsm_service import StateMachineService
@@ -53,26 +59,32 @@ from daedalus.application.gatekeeper.pipeline import (
 )
 from daedalus.application.gatekeeper.tier1 import Tier1Gate
 from daedalus.application.gatekeeper.tier2 import Tier2Gate
+from daedalus.application.repair_evidence import settled_acceptance
+from daedalus.application.requirement_evidence import model_behavior_evidence, verify_seal
 from daedalus.application.scheduler import Quota, Scheduler
 from daedalus.application.worker import CodingWorker, WorkerContext, WorkerResult
+from daedalus.application.worker_checks import observed_behavior_paths, safe_check_receipts
 from daedalus.application.worktree_pool import WorktreePool
 from daedalus.domain.artifacts import Artifact
 from daedalus.domain.canonical import digest_of, sha256_hex
 from daedalus.domain.approval import ApprovalDecision, Approval, approval_required
+from daedalus.domain.events import Event
 from daedalus.domain.fsm import RunState, StepState, execution_counters
 from daedalus.domain.ids import new_id, utc_now
 from daedalus.domain.spec import PlanNode, SpecBundle, node_subject_digest
 from daedalus.errors import (
+    BoundaryViolation,
     CommitConflict,
     DaedalusError,
     SpecApprovalRequired,
     SpecDigestMismatch,
 )
-from daedalus.infrastructure.git_sandbox import GitSandbox
+from daedalus.infrastructure.git_sandbox import GitSandbox, fast_forward_branch
 from daedalus.infrastructure.redact import redact_text
 from daedalus.infrastructure.sandbox import DriverChoice, DriverRegistry, IsolationUnavailable
 from daedalus.infrastructure.store.event_store import EventStore, idempotency_key
 from daedalus.model.base import TokenBudget
+from daedalus.security.outbound import SecretInPayload
 
 #: Failure classes that must never be auto-retried (Spec §17). Retrying these spends
 #: budget on a question whose answer cannot change, and in the boundary case would
@@ -99,6 +111,9 @@ NON_RETRYABLE_ERRORS = frozenset(
         "model_call_failed",
         "model_usage_unknown",
         "worker_no_progress",
+        "worker_action_limit",
+        "worker_deadline_exceeded",
+        "isolation_unavailable",
         "model_tls_configuration_error",
         "model_tls_verification_failed",
         "execution_environment_unavailable",
@@ -230,6 +245,8 @@ class RunOrchestrator:
     #: Spec §13.2 artifact reuse. Off by default so an ordinary run never silently skips
     #: work; a replay turns it on deliberately.
     reuse_artifacts: bool = False
+    # None is an ordinary same-spec replay; an explicit empty list forces every node to run.
+    replay_reusable_nodes: tuple[str, ...] | None = None
     #: Only an explicit authority decision may park execution; ordinary failures close
     #: FAILED/PARTIAL_FAILURE. Final delivery review is configured independently.
     park_on_escalation: bool = True
@@ -265,6 +282,7 @@ class RunOrchestrator:
     goal_stage_number: int = 1
     stage_feedback: str = ""
     _goal_approved_commit: str = field(default="", init=False, repr=False)
+    _replay_history: tuple[Event, ...] | None = field(default=None, init=False, repr=False)
 
     fsm: StateMachineService = field(init=False)
     pool: WorktreePool | None = field(default=None, init=False)
@@ -282,7 +300,10 @@ class RunOrchestrator:
 
     def __post_init__(self) -> None:
         self.bundle.validate()
-        self.goal_audit_enabled = self.goal_audit_enabled or self._requires_delivery_review()
+        self.goal_audit_enabled = (
+            self.goal_audit_enabled or self.bundle.plan.integrated_acceptance
+            or self._requires_delivery_review()
+        )
         self.fsm = StateMachineService(self.store)
         # Spec §3.2, fail-closed. Every construction site that forgot `identity=` silently
         # disabled owner verification, because the policy read
@@ -561,6 +582,8 @@ class RunOrchestrator:
             payload={
                 "goal_id": self.bundle.goal.goal_id,
                 "spec_digest": self.spec_digest,
+                "parent_execution_id": self.parent_execution_id,
+                "replay_from_commit": self.replay_from_commit,
                 "base_commit": base_commit,
                 "run_branch": pool.run_branch,
                 "max_parallel_steps": self.quota.max_parallel_steps,
@@ -569,6 +592,9 @@ class RunOrchestrator:
                 "manual_review_levels": list(self.manual_review_levels),
                 "repo_path": str(self.repo_path),
                 "reuse_artifacts": self.reuse_artifacts,
+                "replay_reusable_nodes": (
+                    list(self.replay_reusable_nodes) if self.replay_reusable_nodes is not None else None
+                ),
                 "target_branch": self.target_branch,
                 "goal_audit_enabled": self.goal_audit_enabled,
                 "independent_validation_levels": sorted(
@@ -1373,6 +1399,9 @@ class RunOrchestrator:
         if row is None:
             return None
         node = self.bundle.plan.node(str(row["node_id"]))
+        if (self.replay_reusable_nodes is not None
+                and node.node_id not in self.replay_reusable_nodes):
+            return None
         key = self._reuse_key(step_id, pool)
         decision = self.cache.lookup(key, exclude_execution_id=self.execution_id)
         if not decision.reusable:
@@ -1403,7 +1432,9 @@ class RunOrchestrator:
                 return None
             if not _is_ancestor_commit(self.repo_path, head, decision.commit):
                 return None
-            _git_update_ref(self.repo_path, pool.run_branch, decision.commit, head)
+            fast_forward_branch(
+                self.repo_path, pool.run_branch, decision.commit, expected_old=head,
+            )
 
         self.store.record_metric(
             name="cache_hits",
@@ -1634,6 +1665,18 @@ class RunOrchestrator:
                 )
                 scheduler.propagate_failure(node.node_id)
                 return None
+        try:
+            worker_boundary = self._step_boundary(node, attempt)
+        except BoundaryViolation as error:
+            self.fsm.transition_step(
+                step_id=step_id, execution_id=self.execution_id,
+                event_type="StepExecutionFailed", actor=self.actor, outcome="escalate",
+                payload={"reason": redact_text(error.message),
+                         "error_code": error.code, "branch_retryable": False},
+                correlation_id=self.correlation_id,
+            )
+            scheduler.propagate_failure(node.node_id)
+            return None
         # The control plane owns the budget (SPEC-03 per step, quota per run). A worker that
         # was handed a different TokenBudget would have its spending accounted somewhere the
         # gate never looks, which silently disables the resource boundary.
@@ -1678,13 +1721,22 @@ class RunOrchestrator:
             step_id, state=StepState.RUNNING.value, worktree_path=str(sandbox.worktree_path)
         )
 
-        worker_bundle = self.bundle
-        if self.goal_audit_enabled and attempt > 1:
-            worker_bundle = replace(
-                self.bundle, boundary=replace(
-                    self.bundle.boundary, fs_whitelist=tuple(node.expected_artifacts),
-                ),
-            )
+        worker_bundle = self.bundle if worker_boundary is self.bundle.boundary else replace(
+            self.bundle, boundary=worker_boundary,
+        )
+        recall = attempt > 1 or self.resume or node.extra.get("repair_memory") or (
+            self.parent_execution_id and self.replay_from_commit
+        )
+        run_events = self.store.events_for(f"run:{self.run_id}") if recall else ()
+        rejected = frozenset(
+            tree for event in run_events
+            if event.execution_id == self.execution_id and event.event_type == "TrunkNodeFailed"
+            and event.payload.get("node_id") == node.node_id
+            and event.payload.get("base_commit", event.payload.get("commit")) == base_commit
+            and event.payload.get("spec_digest") == self.spec_digest
+            and event.payload.get("rejected_by_gate") is True
+            and isinstance(tree := event.payload.get("candidate_tree"), str) and tree
+        )
 
         context = WorkerContext(
             step_id=step_id,
@@ -1694,11 +1746,13 @@ class RunOrchestrator:
             base_commit=base_commit,
             attempt=attempt,
             revision_feedback="\n".join(filter(None, [
-                self.stage_feedback, self._revision_feedback(step_id) if attempt > 1 else "",
+                self.stage_feedback,
+                self._revision_feedback(step_id, events=run_events) if attempt > 1 else "",
             ])),
             input_artifacts=self._input_artifacts(node.deps),
-            repair_memory=self._repair_memory(step_id)
-            if attempt > 1 or self.resume or node.extra.get("repair_memory") else (),
+            repair_memory=self._repair_memory(step_id, base_commit=base_commit, events=run_events)
+            if recall else (),
+            rejected_candidate_trees=rejected,
         )
         prepared = _PreparedStep(
             step_id=step_id,
@@ -1739,6 +1793,31 @@ class RunOrchestrator:
         node = prepared.node
         worker_result = execution.worker_result
         duration_ms = execution.duration_ms
+        try:
+            worker_metadata = self._worker_metadata(worker_result)
+        except SecretInPayload as error:
+            worker_result = replace(
+                worker_result, ok=False, summary="worker observations contain sensitive data",
+                execution_log="Sensitive worker observations were refused before persistence.",
+                error=error.code, extra={},
+            )
+            worker_metadata = {}
+        if any(worker_metadata.values()):
+            path_checks = any("behavior_path_evidence" in row for row in worker_metadata.get("check_receipts", ()))
+            worker_spec = (
+                {"worker_spec_digest": self.spec_digest if prepared.context.bundle is self.bundle
+                 else prepared.context.bundle.digest()} if path_checks else {}
+            )
+            self.store.append(
+                aggregate_id=f"run:{self.run_id}", execution_id=self.execution_id,
+                event_type="WorkerEngineeringObserved", actor=self.actor,
+                payload={
+                    "node_id": node.node_id, "step_id": step_id, "attempt": prepared.attempt,
+                    "spec_digest": self.spec_digest, **worker_metadata,
+                    **worker_spec,
+                },
+                correlation_id=self.correlation_id,
+            )
 
         self.store.record_metric(
             name="sandbox_runtime_ms",
@@ -1764,19 +1843,20 @@ class RunOrchestrator:
                 non_retryable=worker_result.error in NON_RETRYABLE_ERRORS,
                 sandbox=sandbox,
                 error_code=worker_result.error,
+                worker_metadata=worker_metadata,
             )
 
-        if self._repeated_candidate(step_id, sandbox, worker_result, prepared.attempt):
+        if (prepared.context.rejected_candidate_trees
+                and sandbox.tree_digest() in prepared.context.rejected_candidate_trees):
             return self._fail_step(
                 step_id=step_id, node_id=node.node_id, attempt=prepared.attempt,
-                reason="candidate already rejected without new source or observation evidence",
-                detail="This exact patch was already rejected on this base. Propose a different "
-                       "implementation; no repeated semantic review was dispatched.\n"
-                       + self._revision_feedback(step_id),
+                reason="candidate already rejected on the same base and frozen spec",
+                detail="This exact tree was already rejected on this base. Propose a different "
+                       "implementation; unchanged rejected candidates are not re-gated.",
                 duration_ms=duration_ms, tokens_used=worker_result.tokens_used,
                 scheduler=scheduler, lease_id=prepared.lease_id, sandbox=sandbox,
                 error_code="repeated_rejected_candidate",
-                candidate_evidence=self._candidate_evidence(worker_result),
+                worker_metadata=worker_metadata,
             )
 
         self.fsm.transition_step(
@@ -1830,20 +1910,17 @@ class RunOrchestrator:
         )
 
         if not gate.tier1.passed:
-            return self._fail_step(
+            return self._fail_tier1(
+                gate, sandbox,
                 step_id=step_id,
                 node_id=node.node_id,
                 attempt=prepared.attempt,
                 reason="execution environment unavailable" if gate.tier1.infrastructure_errors else "Tier-1 deterministic gate failed",
-                detail=gate.tier1.revise_feedback(),
                 duration_ms=duration_ms,
                 tokens_used=self.budget.step_used,
                 scheduler=scheduler,
                 lease_id=prepared.lease_id,
-                decision=GateDecision.REVISE.value,
                 already_decided=True,
-                non_retryable=any(code in NON_RETRYABLE_ERRORS for code in gate.tier1.infrastructure_errors),
-                sandbox=sandbox,
             )
 
         # ---- tier2 decision (only reachable after tier1 passed)
@@ -1907,7 +1984,8 @@ class RunOrchestrator:
                 already_decided=True,
                 sandbox=sandbox,
                 error_code="semantic_revision",
-                candidate_evidence=self._candidate_evidence(worker_result),
+                rejected_by_gate=True,
+                worker_metadata=worker_metadata,
             )
 
         # ---- commit and integrate
@@ -2262,6 +2340,10 @@ class RunOrchestrator:
             )
             return -1, "", ""
 
+        # The sibling commits are already on the integration trunk. The re-gate
+        # must see only this candidate's delta against its new parent.
+        sandbox.base_commit = upstream
+
         rebase_artifact = self._artifact_for(
             step_id=step_id,
             node_id=node.node_id,
@@ -2289,18 +2371,16 @@ class RunOrchestrator:
         )
 
         if not regate.tier1.passed:
-            self._rebase_failure = self._fail_step(
+            self._rebase_failure = self._fail_tier1(
+                regate, sandbox,
                 step_id=step_id,
                 node_id=node.node_id,
                 attempt=attempt,
                 reason="Tier-1 failed after rebasing onto the run branch",
-                detail=regate.tier1.revise_feedback(),
                 duration_ms=duration_ms,
                 tokens_used=self.budget.step_used,
                 scheduler=scheduler,
                 lease_id=lease_id,
-                decision=GateDecision.REVISE.value,
-                sandbox=sandbox,
             )
             return -1, "", ""
 
@@ -2317,6 +2397,17 @@ class RunOrchestrator:
                 lease_id=lease_id,
                 decision=regate.decision.value,
                 sandbox=sandbox,
+            )
+            return -1, "", ""
+        if (sandbox.head() != detail
+                or sandbox.tree_digest() != rebase_artifact.extra["gated_tree"]):
+            self._rebase_failure = self._fail_step(
+                step_id=step_id, node_id=node.node_id, attempt=attempt,
+                reason="the worktree changed after the rebase gate reviewed it",
+                detail="The rebased commit or content tree no longer matches the reviewed artifact.",
+                duration_ms=duration_ms, tokens_used=self.budget.step_used,
+                scheduler=scheduler, lease_id=lease_id,
+                decision=GateDecision.REVISE.value, sandbox=sandbox,
             )
             return -1, "", ""
 
@@ -2378,7 +2469,7 @@ class RunOrchestrator:
         return Artifact(
             step_id=step_id,
             execution_id=self.execution_id,
-            parent_commit=sandbox.head(),
+            parent_commit=sandbox.base_commit,
             changed_files=tuple(sorted(changed_files)),
             patch_digest=sha256_hex(patch),
             artifact_digest="",
@@ -2386,7 +2477,7 @@ class RunOrchestrator:
             node_spec_digest=node_subject_digest(self.bundle, self.bundle.plan.node(node_id)),
             dependency_digest=self._dependency_digest(sandbox),
             toolchain_digest=self._toolchain_digest(),
-            code_base_digest=sha256_hex(sandbox.head()),
+            code_base_digest=sha256_hex(sandbox.base_commit),
             input_artifact_digest=self._input_digest(node_id),
             execution_log_ref=execution_log_ref(self.run_id, step_id),
             status=status,
@@ -2440,6 +2531,30 @@ class RunOrchestrator:
         )
 
     # ------------------------------------------------------------------ failure
+    def _fail_tier1(
+        self, gate: GateOutcome, sandbox: GitSandbox, *, step_id: str, node_id: str,
+        attempt: int, reason: str, duration_ms: int, tokens_used: int, scheduler: Scheduler,
+        lease_id: str, already_decided: bool = False,
+    ) -> StepOutcome:
+        settled = [row for check in gate.tier1.checks for row in check.evidence.get("criteria", ())
+                   if settled_acceptance(row)]
+        outcomes = {row["criterion_id"]: row["ok"] for row in settled}
+        actual_failure = False in outcomes.values()
+        blocking_code = next(
+            (code for code in gate.tier1.infrastructure_errors if code in NON_RETRYABLE_ERRORS), "",
+        )
+        return self._fail_step(
+            step_id=step_id, node_id=node_id, attempt=attempt, reason=reason,
+            detail=gate.tier1.revise_feedback(), duration_ms=duration_ms, tokens_used=tokens_used,
+            scheduler=scheduler, lease_id=lease_id, already_decided=already_decided,
+            non_retryable=bool(blocking_code),
+            error_code=blocking_code or ("executed_acceptance_failure" if actual_failure else ""),
+            rejected_by_gate=actual_failure, gate_outcomes=outcomes,
+            behavior_gate_result_id=gate.tier1_result_id
+            if any(row.get("behavior_evidence") for row in settled) else "",
+            sandbox=sandbox,
+        )
+
     def _fail_step(
         self,
         *,
@@ -2457,13 +2572,20 @@ class RunOrchestrator:
         non_retryable: bool = False,
         sandbox: GitSandbox | None = None,
         error_code: str = "",
-        candidate_evidence: str = "",
+        rejected_by_gate: bool = False,
+        gate_outcomes: dict[str, bool] | None = None,
+        behavior_gate_result_id: str = "",
+        worker_metadata: dict | None = None,
     ) -> StepOutcome:
         # Preserve evidence before reverting, so rejected code cannot leak into a retry.
         if sandbox is not None:
             self._record_failed_candidate(
                 step_id, sandbox, reason, detail, non_retryable,
-                error_code=error_code, candidate_evidence=candidate_evidence,
+                error_code=error_code,
+                rejected_by_gate=rejected_by_gate,
+                gate_outcomes=gate_outcomes,
+                behavior_gate_result_id=behavior_gate_result_id,
+                worker_metadata=worker_metadata,
             )
         if sandbox is not None:
             sandbox.reset_hard()
@@ -2575,6 +2697,44 @@ class RunOrchestrator:
         return int(row["max_attempts"]) if row else 3
 
     # --------------------------------------------------------------- artifacts
+    def _worker_metadata(self, result: WorkerResult) -> dict:
+        """Persist bounded observations, never arbitrary worker extras or claimed approval."""
+        extra = result.extra if isinstance(result.extra, dict) else {}
+        metadata = {
+            "inspection_receipts": safe_receipts(extra),
+            "check_receipts": safe_check_receipts(extra),
+        }
+        observations = safe_engineering_observations(extra.get("engineering_observations"))
+        if observations["records"] or observations["omitted_records"]:
+            metadata["engineering_observations"] = observations
+        diagnosis = safe_engineering_diagnosis(extra.get("engineering_diagnosis"))
+        if diagnosis:
+            metadata["engineering_diagnosis"] = diagnosis
+        capabilities = extra.get("capabilities", {})
+        if isinstance(capabilities, dict):
+            metadata["capabilities"] = {
+                key: capabilities[key] for key in (
+                    "source", "inspection", "checks", "reference", "investigation", "continuations",
+                ) if type(capabilities.get(key)) is bool
+            }
+        loop = extra.get("engineering_loop", {})
+        if isinstance(loop, dict) and loop:
+            actions = loop.get("actions", [])
+            metadata["engineering_loop"] = {
+                key: loop[key] for key in ("rounds", "edit_rounds")
+                if type(loop.get(key)) is int and 0 <= loop[key] <= 12
+            }
+            if isinstance(actions, list):
+                metadata["engineering_loop"]["actions"] = [
+                    {"action": row["action"], "ok": row["ok"]}
+                    for row in actions[:12] if isinstance(row, dict)
+                    and isinstance(row.get("action"), str)
+                    and row["action"] in {
+                        "candidate", "inspect", "investigate", "check", "edit", "finish",
+                    } and type(row.get("ok")) is bool
+                ]
+        return metadata
+
     def _build_artifact(
         self,
         *,
@@ -2596,7 +2756,7 @@ class RunOrchestrator:
             patch=diff.patch,
             model=str(getattr(worker_result, "model", "")),
             extra={"worker_summary": getattr(worker_result, "summary", ""),
-                   "inspection_receipts": safe_receipts(getattr(worker_result, "extra", {}))},
+                   **self._worker_metadata(worker_result)},
         )
 
     def _input_artifacts(self, deps: tuple[str, ...]) -> tuple[Artifact, ...]:
@@ -2635,7 +2795,7 @@ class RunOrchestrator:
             {
                 "python": sys.version.split()[0],
                 "platform": platform.platform(),
-                "gatekeeper": "daedalus-gatekeeper/3",
+                "gatekeeper": "daedalus-gatekeeper/5",
             }
         )
 
@@ -2666,32 +2826,111 @@ class RunOrchestrator:
         )
 
     def _record_failed_candidate(self, step_id, sandbox, reason, detail, non_retryable, *,
-                                 error_code="", candidate_evidence=""):
+                                 error_code="", rejected_by_gate=False, gate_outcomes=None,
+                                 behavior_gate_result_id="", worker_metadata=None):
         row = self.store.get_step(step_id)
         diff = sandbox.diff()
+        clean_detail = redact_text(detail)
+        worktree = str(sandbox.worktree_path)
         self.store.append(
             aggregate_id=f"run:{self.run_id}", execution_id=self.execution_id,
             event_type="TrunkNodeFailed", actor=self.actor,
             payload={
                 "node_id": str(row["node_id"]), "commit": sandbox.head(), "criteria": [],
+                "base_commit": sandbox.base_commit,
+                "spec_digest": self.spec_digest,
                 "candidate_tree": sandbox.tree_digest(),
                 "step_id": step_id, "attempt": int(row["attempt"]),
-                "error_code": error_code, "candidate_evidence": candidate_evidence,
+                "error_code": error_code,
+                "rejected_by_gate": rejected_by_gate,
+                **({"gate_outcomes": gate_outcomes} if gate_outcomes is not None else {}),
+                **({"behavior_gate_result_id": behavior_gate_result_id} if behavior_gate_result_id else {}),
                 "reason": redact_text(reason),
-                "detail": failure_excerpt(redact_text(detail), limit=4000),
+                "detail": failure_excerpt(clean_detail.replace(worktree + "/", ""), limit=4000),
+                "detail_digest": digest_of(clean_detail),
+                "detail_paths": "relative_to_worktree",
+                "worktree": worktree,
                 "retryable": not non_retryable, "patch_digest": digest_of(diff.patch),
                 "patch": redact_text(diff.patch)[:PATCH_PREVIEW_BYTES],
                 "changed_files": list(diff.files),
+                "worker_evidence": worker_metadata or {},
             },
             correlation_id=self.correlation_id,
         )
 
-    def _repair_memory(self, step_id: str) -> tuple[dict[str, Any], ...]:
-        """Recall scoped attempts, including resumed executions and explicit frozen lineage.
+    def _replay_parent_history(self) -> tuple[Event, ...]:
+        """Load one explicitly named failed parent, never search unrelated tasks."""
+        if not self.parent_execution_id or not self.replay_from_commit or self.goal_stage_parent:
+            return ()
+        if self._replay_history is not None:
+            return self._replay_history
+        self._replay_history = ()
+        source = self.store.get_execution(self.parent_execution_id)
+        if not source or source["spec_digest"] != self.spec_digest:
+            return ()
+        end = None
+        events = tuple(
+            event for event in self.store.events_for(f"run:{source['run_id']}")
+            if event.execution_id == self.parent_execution_id
+        )
+        start = next((event for event in events if event.event_type == "RunStarted"), None)
+        if (
+            start is None or start.payload.get("spec_digest") != self.spec_digest
+            or start.payload.get("base_commit") != self.replay_from_commit
+            or start.payload.get("repo_path") != str(self.repo_path)
+        ):
+            return ()
+        for i, event in enumerate(events):
+            if event.event_type in {"RunFailed", "RunPartiallyFailed"}:
+                end = i
+                break
+        if end is not None:
+            self._replay_history = events[:end]
+        return self._replay_history
 
-        These observations guide edits, never establish current acceptance or authority.
-        Unrelated runs are not searched or imported implicitly.
-        """
+    def _historical_behavior_paths(self, record: dict, gate: dict, criteria: dict[str, str]) -> list[dict]:
+        """Read the exact recorded Tier-1 result; never turn history into current approval."""
+        if (
+            gate.get("tier") != 1
+            or gate.get("execution_id") != record["source_execution_id"]
+            or gate.get("subject_digest") != self.spec_digest
+            or record["source_spec_digest"] != self.spec_digest
+        ):
+            return []
+        try:
+            checks = json.loads(gate["evidence"])["checks"]
+        except (KeyError, TypeError, ValueError):
+            return []
+        remembered = []
+        for check in checks:
+            for row in check.get("evidence", {}).get("criteria", ()):
+                evidence = row.get("behavior_evidence")
+                if not evidence or not settled_acceptance(row):
+                    continue
+                criterion_id = row["criterion_id"]
+                receipt = evidence["receipt"]
+                if (
+                    receipt.get("reviewed_tree") != record["candidate_tree"]
+                    or receipt.get("reviewed_commit") != record["commit"]
+                    or criterion_id not in criteria
+                    or evidence.get("criterion_digest") != criteria.get(criterion_id)
+                    or receipt.get("passed") is not row["ok"]
+                ):
+                    continue
+                try:
+                    verify_seal(receipt)
+                except ValueError:
+                    continue
+                paths = model_behavior_evidence(evidence).get("behavior_paths")
+                if paths:
+                    remembered.append({"criterion_id": criterion_id, "receipt_sha256": receipt["sha256"],
+                                       "paths": paths})
+        return remembered
+
+    def _repair_memory(
+        self, step_id: str, *, base_commit: str = "", events: list[Event] | tuple[Event, ...] | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        """Recall local failures and explicitly scoped lineage as historical evidence."""
         step = self.store.get_step(step_id)
         if step is None:
             return ()
@@ -2702,32 +2941,74 @@ class RunOrchestrator:
                 and seed.get("node_id") == node.node_id
                 and seed.get("paths") == list(node.expected_artifacts)
                 and isinstance(seed.get("entries"), list)):
-            records.extend(item for item in seed["entries"] if isinstance(item, dict))
-        checked = {}
-        for event in self.store.events_for(f"run:{self.run_id}"):
-            if (event.event_type == "TrunkNodeFailed"
-                    and event.payload.get("node_id") == node.node_id
-                    and event.payload.get("gate_result_id")):
-                checked[event.payload.get("attempt")] = {
+            records.extend({
+                key: value for key, value in item.items()
+                if key not in {"behavior_gate_result_id", "requested_checks", "worker_spec_digest"}
+            } for item in seed["entries"] if isinstance(item, dict))
+        checked, worker_history = {}, {}
+
+        parent = self._replay_parent_history() if base_commit else ()
+        definitions = {
+            criterion.criterion_id: criterion
+            for criterion in (node.acceptance_criteria or self.bundle.goal.acceptance_criteria)
+        }
+        criteria = {key: digest_of(criterion.to_dict()) for key, criterion in definitions.items()}
+        if events is None:
+            events = self.store.events_for(f"run:{self.run_id}")
+        for event in chain(parent, events):
+            if event.payload.get("node_id") != node.node_id:
+                continue
+            identity = (event.execution_id, event.payload.get("attempt"))
+            if event.event_type == "WorkerEngineeringObserved":
+                worker_history[identity] = {
+                    "requested_checks": safe_check_receipts(event.payload),
+                    "worker_spec_digest": event.payload.get("worker_spec_digest"),
+                    "engineering_observations": safe_engineering_observations(
+                        event.payload.get("engineering_observations")),
+                    "engineering_diagnosis": safe_engineering_diagnosis(
+                        event.payload.get("engineering_diagnosis")),
+                    "source_spec_digest": event.payload.get("spec_digest", ""),
+                }
+            if event.event_type == "TrunkNodeFailed" and event.payload.get("gate_result_id"):
+                checked[identity] = {
                     "failed_criteria": [
                         row["criterion_id"] for row in event.payload.get("criteria", [])
-                        if row.get("ok") is False and not row.get("error_code")
+                        if row.get("ok") is False and settled_acceptance(row)
                     ],
                     "passed_criteria": [
                         row["criterion_id"] for row in event.payload.get("criteria", [])
-                        if row.get("ok") is True and row.get("executed") is not False
+                        if row.get("ok") is True and settled_acceptance(row)
                     ],
                 }
-            if (event.event_type == "TrunkNodeFailed"
-                    and event.payload.get("node_id") == node.node_id
-                    and event.payload.get("patch_digest")):
+            if event.event_type == "TrunkNodeFailed" and event.payload.get("patch_digest"):
+                inherited = event.execution_id == self.parent_execution_id and bool(parent)
+                if inherited and (
+                    event.payload.get("base_commit", event.payload.get("commit")) != base_commit
+                    or event.payload.get("spec_digest") != self.spec_digest
+                    or (
+                        event.payload.get("error_code") not in {
+                            "executed_acceptance_failure", "semantic_revision",
+                        }
+                        and not worker_history.get(identity, {}).get("requested_checks")
+                    )
+                ):
+                    continue
+                outcomes = event.payload.get("gate_outcomes")
+                observations = checked.get(identity, {}) if outcomes is None else {
+                    "failed_criteria": [key for key, value in outcomes.items() if value is False],
+                    "passed_criteria": [key for key, value in outcomes.items() if value is True],
+                }
                 records.append({
                     **event.payload, "source_event_id": event.event_id,
-                    "source_run_id": self.run_id, "source_execution_id": event.execution_id,
-                    "source_spec_digest": self.spec_digest,
-                    **checked.get(event.payload.get("attempt"), {}),
+                    "source_run_id": event.aggregate_id.removeprefix("run:"),
+                    "source_execution_id": event.execution_id,
+                    **worker_history.get(identity, {}),
+                    "source_spec_digest": event.payload.get("spec_digest")
+                    or worker_history.get(identity, {}).get("source_spec_digest", ""),
+                    **observations,
                 })
         selected, seen, used = [], set(), 0
+        gate_history: dict[str, dict[str, dict]] = {}
         for item in reversed(records):
             key = (str(item.get("source_run_id", "")), str(item.get("source_execution_id", "")),
                    str(item.get("attempt", "")), str(item.get("patch_digest", "")))
@@ -2740,6 +3021,9 @@ class RunOrchestrator:
                     "attempt", "error_code", "commit", "candidate_tree", "patch_digest",
                 )
             }
+            record_base = item.get("base_commit", record["commit"])
+            if record_base != record["commit"]:
+                record["base_commit"] = record_base
             failed = item.get("failed_criteria", [])
             record["failed_criteria"] = [str(key)[:128] for key in failed[:12]] \
                 if isinstance(failed, list) else []
@@ -2753,9 +3037,74 @@ class RunOrchestrator:
                     "semantic_revision", "repeated_rejected_candidate", "historical_stop"}
                 else "edit_or_control_failure"
             )
-            record["observation"] = failure_excerpt(redact_text(
-                str(item.get("reason", "")) + "\n" + str(item.get("detail", ""))
-            ), limit=700)
+            if (base_commit and record_base == base_commit
+                    and (gate_id := item.get("behavior_gate_result_id"))
+                    and (source_step := item.get("step_id"))):
+                if source_step not in gate_history:
+                    gate_history[source_step] = {
+                        gate["gate_result_id"]: gate for gate in self.store.gate_results_for_step(source_step)
+                    }
+                if paths := self._historical_behavior_paths(record, gate_history[source_step].get(gate_id, {}), criteria):
+                    record["historical_behavior_paths"] = paths
+            requested = item.get("requested_checks", [])
+            if isinstance(requested, list) and requested:
+                scoped = [
+                    check for check in requested[:3]
+                    if check["execution_id"] == record["source_execution_id"]
+                    and check["step_id"] == item.get("step_id")
+                    and check["attempt"] == item.get("attempt")
+                    and check.get("base_commit") == record_base
+                    and check.get("tree_digest") == check.get("after_tree_digest")
+                    and bool(check.get("tree_digest")) and check["executed"]
+                    and not check["error_code"]
+                    and check.get("criterion_digest") == criteria.get(check["criterion_id"])
+                ]
+                record["historical_requested_checks"] = [
+                    {key: check[key] for key in (
+                        "criterion_id", "tree_digest", "after_tree_digest",
+                        "passed", "executed", "error_code",
+                    )} for check in scoped
+                ]
+                if base_commit and record_base == base_commit and record["source_spec_digest"] == self.spec_digest:
+                    paths = {row["criterion_id"]: row for row in record.get("historical_behavior_paths", ())}
+                    for check in reversed(scoped):
+                        criterion = definitions.get(check["criterion_id"])
+                        if criterion is None or criterion.criterion_id in paths:
+                            continue
+                        observed = observed_behavior_paths(
+                            check, criterion, spec_digest=item.get("worker_spec_digest"),
+                            commit=record["commit"], tree=record["candidate_tree"],
+                        )
+                        if observed:
+                            paths[criterion.criterion_id] = observed
+                    if paths:
+                        record["historical_behavior_paths"] = list(paths.values())
+            detail = redact_text(str(item.get("reason", "")) + "\n" + str(item.get("detail", "")))
+            observation = failure_excerpt(detail, limit=700)
+            if record["evidence_kind"] == "executed_check_failure" and len(detail) > 700:
+                frames = re.findall(r'(?m)^[ \t]*(File "[^"\r\n]{1,160}", line [1-9][0-9]{0,5})',
+                                    detail)
+                if frames and frames[-1] not in observation:
+                    frame = frames[-1] + "\n"
+                    observation = frame + failure_excerpt(detail, limit=700 - len(frame))
+            record["observation"] = observation
+            history = safe_engineering_observations(item.get("engineering_observations"))
+            if history["records"] or history["omitted_records"]:
+                recent = history["records"][-2:]
+                record["historical_engineering_observations"] = {
+                    "records": [
+                        {**observation,
+                         "content": failure_excerpt(observation["content"], limit=600),
+                         "truncated": observation["truncated"]
+                         or len(observation["content"]) > 600}
+                        for observation in recent
+                    ],
+                    "omitted_records": history["omitted_records"]
+                    + len(history["records"]) - len(recent),
+                }
+            diagnosis = safe_engineering_diagnosis(item.get("engineering_diagnosis"))
+            if diagnosis:
+                record["historical_diagnosis"] = diagnosis
             size = len(json.dumps(record, ensure_ascii=False))
             if len(selected) < 8 and used + size <= 6000:
                 selected.append(record)
@@ -2767,14 +3116,18 @@ class RunOrchestrator:
                                 "note": "History is bounded; omitted observations are not resolved."})
         return tuple(selected)
 
-    def _revision_feedback(self, step_id: str) -> str:
+    def _revision_feedback(self, step_id: str, *, events: list[Event] | tuple[Event, ...] | None = None) -> str:
         row = self.store.get_step(step_id)
         if row is None:
             return ""
-        for event in reversed(self.store.events_for(f"run:{self.run_id}")):
+        if events is None:
+            events = self.store.events_for(f"run:{self.run_id}")
+        for event in reversed(events):
             if (event.execution_id == self.execution_id and event.event_type == "TrunkNodeFailed"
                     and event.payload.get("node_id") == row["node_id"]
                     and event.payload.get("patch_digest")):
+                if event.payload.get("error_code") == "repeated_rejected_candidate":
+                    continue
                 evidence = event.payload
                 feedback = (
                     str(evidence.get("reason", "")) + "\n"
@@ -2787,33 +3140,6 @@ class RunOrchestrator:
                 return feedback[:5500]
         return str(row["last_failure"] or "")
 
-    def _candidate_evidence(self, result: WorkerResult) -> str:
-        return digest_of([
-            receipt["evidence_digest"]
-            for receipt in safe_receipts(result.extra.get("inspection_receipts", []))
-            if receipt.get("evidence_digest")
-        ])
-
-    def _repeated_candidate(self, step_id, sandbox, worker_result, attempt) -> bool:
-        if attempt <= 1:
-            return False
-        patch = sandbox.diff().patch
-        if not patch:
-            return False
-        row = self.store.get_step(step_id)
-        patch_digest = digest_of(patch)
-        evidence_digest = self._candidate_evidence(worker_result)
-        return any(
-            event.execution_id == self.execution_id
-            and event.event_type == "TrunkNodeFailed"
-            and event.payload.get("node_id") == row["node_id"]
-            and event.payload.get("error_code") in {"semantic_revision", "repeated_rejected_candidate"}
-            and event.payload.get("commit") == sandbox.base_commit
-            and event.payload.get("patch_digest") == patch_digest
-            and event.payload.get("candidate_evidence") == evidence_digest
-            for event in self.store.events_for(f"run:{self.run_id}")
-        )
-
     def _gate(
         self,
         *,
@@ -2825,7 +3151,8 @@ class RunOrchestrator:
     ) -> GateOutcome:
         """Run the two-tier gate against one worktree, bound to the frozen spec digest."""
         gatekeeper = self._get_gatekeeper(node)
-        return gatekeeper.gate(
+        started = time.monotonic()
+        outcome = gatekeeper.gate(
             artifact=artifact,
             sandbox=sandbox,
             goal_intent=self.bundle.goal.objective
@@ -2840,16 +3167,39 @@ class RunOrchestrator:
             elapsed_sec=elapsed_sec,
             tokens_used=self.budget.step_used,
         )
+        self.store.record_metric(
+            name="gate_runtime_ms", value=(time.monotonic() - started) * 1000, unit="ms",
+            run_id=self.run_id, step_id=artifact.step_id,
+            labels={"phase": "rebase" if artifact.status == "REBASE_REQUIRED" else "candidate"},
+        )
+        return outcome
+
+    def _step_boundary(self, node: PlanNode, attempt: int):
+        """Narrow owned DAG artifacts and repair scopes against the original authority."""
+        from daedalus.application.branch_repair import repair_boundary
+
+        boundary = self.bundle.boundary
+        explicit = node.extra.get("repair_allowed_paths")
+        if explicit is not None:
+            if type(explicit) not in (list, tuple):
+                raise BoundaryViolation("repair output scope must be concrete paths")
+            boundary = repair_boundary(self.bundle, tuple(explicit))
+        if self.bundle.plan.integrated_acceptance or (self.goal_audit_enabled and attempt > 1):
+            expected = repair_boundary(self.bundle, tuple(node.expected_artifacts))
+            if explicit is not None:
+                paths = tuple(path for path in expected.fs_whitelist
+                              if path in boundary.fs_whitelist)
+                boundary = repair_boundary(self.bundle, paths)
+            else:
+                boundary = expected
+        return boundary
 
     def _get_gatekeeper(self, node: Any) -> Gatekeeper:
         if self.tier2 is not None and hasattr(self.tier2.reviewer, "budget"):
             self.tier2.reviewer.budget = self.budget
-        boundary = self.bundle.boundary
-        if node.extra.get("repair_allowed_paths"):
-            boundary = replace(boundary, fs_whitelist=tuple(node.extra["repair_allowed_paths"]))
         row = self.store.get_step(f"{self.run_id}:{node.node_id}")
+        boundary = self._step_boundary(node, int(row["attempt"]) if row else 1)
         if self.goal_audit_enabled and row and int(row["attempt"]) > 1:
-            boundary = replace(boundary, fs_whitelist=tuple(node.expected_artifacts))
             from daedalus.application.branch_repair import _node_evidence
             from daedalus.application.repair_evidence import build_snapshot
 
@@ -3086,10 +3436,6 @@ def _is_ancestor_commit(repo_path: Path, ancestor: str, descendant: str) -> bool
     return _git(repo_path, ["merge-base", "--is-ancestor", ancestor, descendant], check=False).exit_code == 0
 
 
-def _git_update_ref(repo_path: Path, ref: str, new: str, old: str) -> None:
-    from daedalus.infrastructure.git_sandbox import _git  # noqa: PLC2701 - same package
-
-    _git(repo_path, ["update-ref", f"refs/heads/{ref}", new, old], check=True)
 
 
 def _git_amend_message(sandbox: GitSandbox, message: str) -> None:

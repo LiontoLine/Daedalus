@@ -7,7 +7,7 @@
     <div class="run-progress"><div id="run-progress-fill"></div></div>
     <div class="graph-toolbar">
       <div class="graph-view-label"><span class="graph-symbol" aria-hidden="true">⌘</span><strong>执行图</strong><span id="graph-count" class="muted">DAG</span></div>
-      <div class="graph-tools"><button id="focus-step" class="ghost small" type="button">定位当前</button><button id="graph-fit" class="ghost small" type="button">适应画布</button><span class="tool-divider"></span><button id="graph-zoom-out" class="ghost icon-button" type="button" aria-label="缩小">−</button><span id="graph-zoom" class="zoom-value">100%</span><button id="graph-zoom-in" class="ghost icon-button" type="button" aria-label="放大">＋</button></div>
+      <div class="graph-tools"><button id="graph-inspector" class="ghost small" type="button" aria-controls="step-panel" aria-expanded="false">任务详情</button><button id="focus-step" class="ghost small" type="button">定位节点</button><button id="graph-fit" class="ghost small" type="button">适应画布</button><span class="tool-divider"></span><button id="graph-zoom-out" class="ghost icon-button" type="button" aria-label="缩小">−</button><span id="graph-zoom" class="zoom-value">100%</span><button id="graph-zoom-in" class="ghost icon-button" type="button" aria-label="放大">＋</button></div>
     </div>
     <div id="lane" class="lane-viewport dag-viewport" tabindex="0" aria-label="任务依赖图。拖动画布平移，使用缩放按钮调整，点击节点查看步骤总览。">
       <div id="lane-track" class="lane-track"><div class="graph-empty"><span class="empty-graph-symbol">◇</span><h3>从一个目标开始</h3><p>创建任务后，在这里查看步骤依赖与执行进度。</p><a href="/" class="button primary">新建任务 →</a></div></div>
@@ -16,8 +16,8 @@
     <details class="run-activity" id="run-activity"><summary><span>最近活动</span><span id="activity-latest" class="muted">等待执行记录</span></summary><div id="workspace-activity"></div></details>
     <p class="muted sr-only" id="route-notes"></p>
   </section>
-  <aside class="step-inspector" id="step-panel" aria-label="步骤详情">
-    <header class="inspector-heading"><div class="eyebrow">STEP INSPECTOR</div><div class="inspector-title-row"><h2 id="step-title">步骤总览</h2><button class="ghost icon-button" id="inspector-close" type="button" aria-label="返回任务总览" title="返回任务总览">×</button></div><p id="step-sub" class="muted">点击图上的节点，了解它的目标、进度与产出。</p></header>
+  <aside class="step-inspector" id="step-panel" aria-label="任务与节点详情" hidden>
+    <header class="inspector-heading"><div class="eyebrow">任务检查器</div><div class="inspector-title-row"><h2 id="step-title">步骤总览</h2><button class="ghost icon-button" id="inspector-close" type="button" aria-label="收起详情" title="收起详情">×</button></div><p id="step-sub" class="muted">点击图上的节点，了解它的目标、进度与产出。</p></header>
     <div id="inspector-tabs" class="inspector-tabs" role="tablist" hidden aria-label="步骤信息">
       <button type="button" role="tab" id="tab-overview" aria-selected="true" aria-controls="step-body" data-tab="overview" class="on">总览</button>
       <button type="button" role="tab" id="tab-changes" aria-selected="false" aria-controls="step-body" data-tab="changes">改动</button>

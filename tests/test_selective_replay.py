@@ -525,6 +525,55 @@ def test_a_selective_replay_reuses_the_unaffected_node_and_reruns_the_rest(
     store.close()
 
 
+def test_replay_api_registered_revision_reuses_only_eligible_nodes(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from daedalus.config import load_settings
+    from daedalus.infrastructure.git_sandbox import GitSandbox
+    from daedalus.service.app import create_app
+    from tests.test_service import _wait_for
+
+    repo = _three_file_repo(tmp_path)
+    settings = load_settings(None, workspace_root=str(tmp_path / "workspace"))
+    app = create_app(settings)
+    store = app.state.daedalus.store
+    before = _two_node_bundle(a_intent="return 1", d_intent="return 4")
+    after = _two_node_bundle(a_intent="return 1", d_intent="repair module d")
+    code = {
+        "src/example_project/a.py": "def value():\n    return 1\n",
+        "src/example_project/d.py": "def value():\n    return 4\n",
+    }
+    replay_worker = _PerNodeWorker(code, worker_id="replay-worker")
+    with TestClient(app) as client:
+        first = RunOrchestrator(
+            store=store, repo_path=repo, run_root=tmp_path / "first", bundle=before,
+            worker=_PerNodeWorker(code, worker_id="source-worker"),
+            quota=Quota(max_parallel_steps=1), park_on_escalation=False,
+        )
+        first.register_spec()
+        source = first.run()
+        assert source.status == "COMPLETED"
+        original_head = GitSandbox.main_commit(repo)
+        registration = RunOrchestrator(
+            store=store, repo_path=repo, run_root=tmp_path / "registry", bundle=after,
+            worker=replay_worker,
+        )
+        registration.register_spec()
+        monkeypatch.setattr(app.state.daedalus, "build_worker", lambda **_: (replay_worker, None))
+        response = client.post(f"/api/runs/{source.run_id}/replay", json={
+            "spec_digest": after.digest(), "use_model": True,
+        })
+        assert response.status_code == 202, response.text
+        assert response.json()["selective_replay"]["stale_nodes"] == ["fix-d"]
+        run_id = response.json()["run_id"]
+        assert _wait_for(client, run_id, terminal={"PARTIAL_FAILURE", "FAILED", "COMPLETED"},
+                         timeout=20) == "PARTIAL_FAILURE"
+        assert replay_worker.calls == ["fix-d"]
+        execution = store.get_run(run_id)["execution_id"]
+        events = store.events_for_execution(execution)
+        assert [e.payload["node_id"] for e in events if e.event_type == "StepCacheHit"] == ["fix-a"]
+        assert GitSandbox.main_commit(repo) == original_head
+
+
 def test_an_upstream_change_still_invalidates_its_downstream(tmp_path: Path) -> None:
     """Selective must not become unsound: a dependency change must reach its consumers."""
     before = _chain_bundle()

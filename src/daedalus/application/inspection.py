@@ -6,8 +6,10 @@ import json
 import re
 from dataclasses import dataclass
 
+from daedalus.application.source_context import traceback_locations
 from daedalus.domain.canonical import digest_of
 from daedalus.infrastructure.retrieval_tools import RepositorySearch
+from daedalus.security.boundary import BoundaryGuard
 from daedalus.security.outbound import assert_outbound_clean
 
 MAX_INSPECTIONS = 3
@@ -63,17 +65,80 @@ class InspectionObservation:
 
 
 class RepositoryInspector:
+    @staticmethod
+    def _search(sandbox, context):
+        repo = str(sandbox.worktree_path)
+        committed = RepositorySearch(repo, revision=sandbox.base_commit)
+        guard = BoundaryGuard(boundary=context.bundle.boundary, meta=context.bundle.meta)
+        allowed = set(committed.files)
+        allowed.update(path for path in context.node.expected_artifacts
+                       if guard.check_paths((path,)).allowed)
+        return RepositorySearch(repo, revision=sandbox.tree_digest(), allowed_paths=allowed)
+
+    def traceback_request(self, sandbox, context, feedback: str) -> InspectionRequest | None:
+        """Navigate actual failure hints, never expose a blocked file or invent a type."""
+        feedback = feedback[-64000:].replace('\\"', '"')
+        if "File " not in feedback and "AttributeError:" not in feedback:
+            return None
+        tools = self._search(sandbox, context)
+        names = re.findall(
+            r"AttributeError: ['\"]([A-Z][A-Za-z_0-9]{0,79})['\"] object has no attribute",
+            feedback,
+        )
+        parameters = re.findall(
+            r"(?:\(\s*|,\s*)[A-Za-z_][A-Za-z_0-9]*\s*=\s*['\"]"
+            r"([A-Z][A-Za-z_0-9]{0,79})['\"](?=\s*[,)]|\s*$)",
+            feedback,
+        )
+        for name in list(dict.fromkeys([*reversed(names), *parameters]))[:3]:
+            if any(re.search(r"(?m)^\s*class " + re.escape(name) + r"\b", row["text"])
+                   for row in tools.symbol(name, limit=3)):
+                return InspectionRequest(
+                    "symbol", {"name": name},
+                    "Inspect a current class named by the receiver error or failed subtest; "
+                    "this is a navigation hint, not runtime type or ownership proof.",
+                )
+        if "File " not in feedback:
+            return None
+        for path, line in reversed(traceback_locations(feedback, set(tools.files))):
+            if (path not in context.node.expected_artifacts
+                    and tools.source_status(path) == "readable"):
+                symbol = tools.enclosing_symbol(path, line)
+                if symbol is not None:
+                    return InspectionRequest(
+                        "symbol", {"path": path, "name": symbol},
+                        "Inspect the exact failing consumer and a same-setup input variant; "
+                        "the source relation is a navigation hint, not an executed result.",
+                    )
+                return InspectionRequest(
+                    "read", {"path": path, "line": max(1, line - 20)},
+                    "Inspect the current consumer cited by the failure; "
+                    "this location is a navigation hint, not reproduced execution.",
+                )
+        return None
+
     def __call__(self, sandbox, context, request: InspectionRequest) -> InspectionObservation:
-        tools = RepositorySearch(str(sandbox.worktree_path))
+        tools = self._search(sandbox, context)
+        tree_digest = tools.revision
+        reason = ""
         if request.tool == "read":
             row = tools.read(request.arguments["path"], request.arguments["line"])
             rows = [row] if row else []
+            if row:
+                rows.extend(tools.related(request.arguments["path"], request.arguments["line"]))
+            else:
+                admission = tools.source_status(request.arguments["path"])
+                reason = ("empty_or_out_of_range" if admission == "readable" else admission
+                          if admission != "not_found" else "")
         elif request.tool == "grep":
             paths = (request.arguments["path"],) if "path" in request.arguments else ()
             rows = tools.grep(request.arguments["query"], paths=paths, limit=3, scoped=bool(paths))
         else:
             paths = (request.arguments["path"],) if "path" in request.arguments else ()
             rows = tools.symbol(request.arguments["name"], paths=paths, limit=3)
+            if len(rows) == 1 and rows[0].get("relation") == "definition":
+                rows.extend(tools.related(rows[0]["path"], rows[0]["line_start"]))
+        status = "found" if rows else "unavailable" if reason else "not_found"
         # Keep the observation bounded even if a repository has unusually long lines.
         rows = [{**row, "text": row["text"][:2400]} for row in rows[:3]]
         content = json.dumps(
@@ -81,7 +146,9 @@ class RepositoryInspector:
                 "tool": request.tool,
                 "arguments": dict(request.arguments),
                 "commit": tools.head,
-                "status": "found" if rows else "not_found",
+                "tree_digest": tree_digest,
+                "status": status,
+                **({"unavailable_reason": reason} if reason else {}),
                 "sources": rows,
             },
             ensure_ascii=False,
@@ -94,9 +161,11 @@ class RepositoryInspector:
                 "arguments": dict(request.arguments),
                 "request_digest": request.identity,
                 "commit": tools.head,
+                "tree_digest": tree_digest,
                 "evidence_digest": digest_of(rows),
                 "sources": sorted({row["path"] for row in rows}),
-                "status": "found" if rows else "not_found",
+                "status": status,
+                **({"unavailable_reason": reason} if reason else {}),
             },
         )
 
@@ -114,7 +183,14 @@ def safe_receipts(extra: dict) -> list[dict]:
             continue
         if row["tool"] not in {"read", "grep", "symbol"}:
             continue
-        if not isinstance(row.get("status"), str) or row["status"] not in {"found", "not_found"}:
+        if not isinstance(row.get("status"), str) or row["status"] not in {
+            "found", "not_found", "unavailable",
+        }:
+            continue
+        reason = row.get("unavailable_reason")
+        if row["status"] == "unavailable" and (not isinstance(reason, str) or reason not in {
+            "blocked_sensitive", "too_large", "empty_or_out_of_range",
+        }):
             continue
         if any(
             not isinstance(row.get(k), str) or not re.fullmatch(r"[0-9a-f]{64}", row[k])
@@ -123,6 +199,11 @@ def safe_receipts(extra: dict) -> list[dict]:
             continue
         if not isinstance(row.get("commit"), str) or not re.fullmatch(
             r"(?:[0-9a-f]{40}|[0-9a-f]{64})", row["commit"]
+        ):
+            continue
+        if "tree_digest" in row and (
+            not isinstance(row["tree_digest"], str)
+            or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", row["tree_digest"])
         ):
             continue
         if not isinstance(row.get("arguments"), dict):
@@ -155,6 +236,10 @@ def safe_receipts(extra: dict) -> list[dict]:
             )
         }
         value["arguments"] = dict(request.arguments)
+        if "tree_digest" in row:
+            value["tree_digest"] = row["tree_digest"]
+        if row["status"] == "unavailable":
+            value["unavailable_reason"] = reason
         assert_outbound_clean(json.dumps(value), where="inspection metadata")
         result.append(value)
     return result

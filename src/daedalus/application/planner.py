@@ -15,7 +15,7 @@ decide what it is allowed to touch.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Protocol
 
 from daedalus.domain.canonical import digest_of
@@ -250,13 +250,7 @@ class SpecHardening:
 
         hardened = SpecBundle(
             goal=hardened_goal,
-            plan=PlanSpec(
-                plan_id=bundle.plan.plan_id,
-                goal_id=bundle.plan.goal_id,
-                nodes=tuple(nodes),
-                version=bundle.plan.version,
-                created_at=bundle.plan.created_at,
-            ),
+            plan=replace(bundle.plan, nodes=tuple(nodes)),
             boundary=bounded,
             meta=bundle.meta,
             spec_version=bundle.spec_version,
@@ -385,12 +379,17 @@ _PLANNER_SYSTEM = (
     "  - Do not add read-only/testing-only nodes; tests run automatically in the gates.\n"
     "  - expected_artifacts are concrete file paths within fs_whitelist, never labels "
     "such as test_results. Declare write capability for file-change nodes.\n"
-    "  - In a multi-node DAG, every node with downstream dependents must declare "
-    "executable node-local acceptance_criteria that can pass before downstream code exists.\n"
-    "  - Put node checks in extra.acceptance_criteria. Their union must include every "
-    "original goal criterion; assign the full goal checks to the final integration node.\n"
-    "  - If the files form one coupled API, prefer one atomic file-change node covering "
-    "all those files; the unchanged full goal tests still gate integrated delivery.\n"
+    "  - Split distinct independently checkable outcomes into the smallest useful DAG. "
+    "Give each node a specific objective, concrete files it will change, and direct prerequisites. "
+    "Independent roots have no deps; don't serialize them just to make a list. "
+    "One coherent change with no independently gateable outputs should stay one node.\n"
+    "  - In a multi-node DAG every node must have its own executable check in "
+    "extra.acceptance_criteria, with a unique criterion_id. Use a check scoped to "
+    "that node and its ancestors: e.g. an existing per-module test or a focused behavior probe. "
+    "Do not put the full TEST_COMMAND or a test-only node in the DAG. The controller runs "
+    "the original goal acceptance on the combined candidate before delivery.\n"
+    "  - Each artifact has one owning node. Keep coupled changes to the same file "
+    "or to files that cannot be checked separately in one node.\n"
     "Answer with a single JSON object and nothing else."
 )
 
@@ -421,10 +420,12 @@ class ModelPlanner:
     _last_request: PlanRequest | None = field(default=None, repr=False, compare=False)
     #: True when the first candidate was rejected and a second, structure-corrected one was used.
     repaired: bool = False
+    used_fallback: bool = False
 
     def _give_up(self, reason: str) -> SpecBundle:
         if self.require_model:
             raise ModelError(f"model planning is required here but failed: {reason}")
+        self.used_fallback = True
         # A fallback is still subject to the same operator ceilings as a model plan.
         bundle = self.hardening.harden(self.fallback.plan(self._last_request))
         self.last_adjustments = self.hardening.last_adjustments
@@ -432,6 +433,7 @@ class ModelPlanner:
 
     def plan(self, request: PlanRequest) -> SpecBundle:
         self._last_request = request
+        self.used_fallback = self.repaired = False
         prompt = self._render(request)
         try:
             # The extra context a caller supplies could carry a credential.
@@ -459,13 +461,18 @@ class ModelPlanner:
         try:
             bundle = self._parse(completion.text, request)
         except (SpecError, ValueError, KeyError, TypeError) as error:
-            bundle = self._repair(prompt, request, f"the spec did not parse: {error}")
+            bundle = self._repair(
+                prompt, request, f"the spec did not parse: {error}",
+                correctable=isinstance(error, SpecError),
+            )
             if bundle is None:
                 return self._give_up(f"the model's spec did not parse: {error}")
         try:
             hardened = self.hardening.harden(bundle)
         except SpecError as error:
-            repaired = self._repair(prompt, request, f"the spec failed validation: {error}")
+            repaired = self._repair(
+                prompt, request, f"the spec failed validation: {error}", correctable=True,
+            )
             if repaired is None:
                 return self._give_up(f"the model's spec failed validation: {error}")
             try:
@@ -476,7 +483,7 @@ class ModelPlanner:
         return hardened
 
     def _repair(
-        self, prompt: str, request: PlanRequest, reason: str
+        self, prompt: str, request: PlanRequest, reason: str, *, correctable: bool,
     ) -> SpecBundle | None:
         """One second attempt, quoting the validator's own words.
 
@@ -489,10 +496,11 @@ class ModelPlanner:
         Only the structure is corrected. Nothing is filled in on the model's behalf, the repair
         is not repeated, and a second failure refuses with both reasons.
         """
-        if not self.require_model:
+        if self.repaired or not (self.require_model or correctable):
             return None
         try:
             from daedalus.model.base import budgeted_completion
+            assert_outbound_clean(reason, where="the rejected plan diagnostic")
             completion = budgeted_completion(
                 self.client,
                 [
@@ -503,9 +511,9 @@ class ModelPlanner:
                         content=(
                             "你上一次的 JSON 被控制面拒绝了，原因：\n"
                             f"{reason}\n"
-                            "请重新输出完整的 JSON。注意：每个 node 的 expected_artifacts "
-                            "必须是非空的路径数组（用给出的 TARGET_PATHS），"
-                            "acceptance_criteria 至少一条，且都必须落在 fs_whitelist 内。"
+                            "请重新输出一个完整 JSON；expected_artifacts 必须是落在 TARGET_PATHS "
+                            "内的具体路径。多步骤各自声明可独立运行的 extra.acceptance_criteria；"
+                            "整题验收由控制面执行。"
                         ),
                     ),
                 ],
@@ -542,7 +550,8 @@ class ModelPlanner:
             '"spec_02_plan":{"plan_id":"...","goal_id":"...","nodes":[{"node_id":"...",'
             '"objective":"...","deps":[],"expected_artifacts":["..."],'
             '"allowed_tools":["read","write"],"retry_policy":{"max_attempts":3},'
-            '"timeout_sec":300}]},'
+            '"timeout_sec":300,"extra":{"acceptance_criteria":[{"criterion_id":"local-id",'
+            '"kind":"exit_code","command":"focused-check","statement":"local behavior"}]}}]},'
             '"spec_03_boundary":{"boundary_id":"...","goal_id":"...",'
             '"fs_whitelist":["..."],"network_policy":"deny","max_tokens_per_step":20000,'
             '"max_runtime_sec":300}}\n\n'
@@ -554,6 +563,39 @@ class ModelPlanner:
         goal = GoalSpec.from_dict(payload["spec_01_goal"])
         plan = PlanSpec.from_dict(payload["spec_02_plan"])
         boundary = BoundarySpec.from_dict(payload["spec_03_boundary"])
+        criteria = request.acceptance_criteria or goal.acceptance_criteria
+        if not request.acceptance_criteria and request.test_command:
+            direct = tuple(c for c in criteria if not c.command)
+            commands = tuple(c for c in criteria if c.kind in {
+                AssertionKind.EXIT_CODE, AssertionKind.TEST_RESULT,
+            } and c.command)
+            selected = next((c for c in commands if c.command == request.test_command), None)
+            if selected is None:
+                taken = {c.criterion_id for c in direct}
+                criterion_id = commands[0].criterion_id if commands else "AC-01-tests"
+                while criterion_id in taken:
+                    criterion_id += "-operator"
+                selected = AcceptanceCriterion(
+                    criterion_id, AssertionKind.EXIT_CODE,
+                    statement="the original project test command exits zero",
+                    command=request.test_command,
+                )
+            criteria = (selected, *direct)
+        goal = replace(
+            goal, objective=request.objective, risk_level=request.risk_level,
+            invariants=request.invariants or goal.invariants,
+            acceptance_criteria=criteria or goal.acceptance_criteria,
+        )
+        boundary = replace(
+            boundary, fs_whitelist=request.target_paths, network_policy=request.network_policy,
+            allowed_domains=boundary.allowed_domains if request.network_policy is NetworkPolicy.ALLOWLIST else (),
+        )
+        multi = len(plan.nodes) > 1
+        nodes = tuple(replace(node, extra={
+            key: value for key, value in node.extra.items()
+            if key in {"lint", "typecheck"} or (multi and key == "acceptance_criteria")
+        }) for node in plan.nodes)
+        plan = replace(plan, nodes=nodes, integrated_acceptance=multi)
         bundle = SpecBundle(
             goal=goal,
             plan=plan,
@@ -562,17 +604,7 @@ class ModelPlanner:
             owner_id=request.owner_id,
         )
         bundle.validate()
-        upstream_ids = {dep for node in plan.nodes for dep in node.deps}
         for node in plan.nodes:
-            if node.node_id in upstream_ids and not any(
-                criterion.kind is not AssertionKind.NATURAL_LANGUAGE
-                for criterion in node.acceptance_criteria
-            ):
-                raise SpecError(
-                    f"upstream node {node.node_id} has no executable extra.acceptance_criteria; "
-                    "whole-goal tests may depend on unfinished downstream code. Declare "
-                    "independent node checks or group coupled file changes into one atomic node"
-                )
             if node.allowed_tools and "write" not in node.allowed_tools:
                 raise SpecError(
                     f"node {node.node_id} is read-only; this executor requires file changes; "

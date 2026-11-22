@@ -56,6 +56,61 @@ def test_secret_files_and_symlinks_never_supply_partial_snippets(git_repo, tmp_p
     search = RepositorySearch(str(git_repo))
     assert search.grep("advance_cursor") == []
     assert search.read("linked.py") is None
+    assert search.related("bad.py", 2) == []
+    assert search.source_status("bad.py") == "blocked_sensitive"
+    assert search.source_status("linked.py") == "not_found"
+
+
+def test_tree_snapshot_reads_searches_and_symbols_stay_pinned_after_later_edits(git_repo):
+    commit(
+        git_repo,
+        **{
+            "engine.py": "def old_cursor():\n    return 7\n",
+            "README.md": "# Cursor\n[Implementation](engine.py)\n",
+        },
+    )
+    head = _git(git_repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
+    snapshot_source = "def advance_cursor():\n    return 11\n\nadvance_cursor()\n"
+    (git_repo / "engine.py").write_text(snapshot_source)
+    _git(git_repo, ["add", "engine.py"], check=True)
+    tree = _git(git_repo, ["write-tree"], check=True).stdout.strip()
+    snapshot = RepositorySearch(
+        str(git_repo), revision=tree, allowed_paths={"engine.py", "README.md"}
+    )
+    committed = RepositorySearch(str(git_repo))
+    (git_repo / "engine.py").write_text("def later_cursor():\n    return 99\n")
+
+    assert snapshot.head == committed.head == head
+    assert committed.read("engine.py")["source"] == f"git:{head}:engine.py"
+    assert "old_cursor" in committed.read("engine.py")["text"]
+    assert committed.grep("advance_cursor") == []
+    assert snapshot.read("engine.py")["text"] == snapshot_source
+    assert snapshot.grep("old_cursor") == []
+    hits = snapshot.grep("advance_cursor")
+    symbols = snapshot.symbol("advance_cursor")
+    assert {row["relation"] for row in symbols} == {"definition", "caller"}
+    assert {row["source"] for row in hits + symbols + snapshot.code_chunks()} == {
+        f"git:{tree}:engine.py"
+    }
+    assert snapshot.follow_link(snapshot.read("README.md"))["text"] == snapshot_source
+    assert committed.follow_link(snapshot.read("README.md")) is None
+
+
+@pytest.mark.parametrize("revision", ["HEAD", "HEAD^{tree}", "--all", "a" * 12, "f" * 40, 7])
+def test_explicit_revision_rejects_refs_options_abbreviations_and_missing_objects(git_repo, revision):
+    with pytest.raises(ValueError):
+        RepositorySearch(str(git_repo), revision=revision)
+
+
+def test_explicit_revision_accepts_commits_but_not_blob_objects(git_repo):
+    commit(git_repo, **{"engine.py": "def advance_cursor():\n    return 7\n"})
+    head = _git(git_repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
+    blob = _git(git_repo, ["rev-parse", "HEAD:engine.py"], check=True).stdout.strip()
+    assert RepositorySearch(str(git_repo), revision=head).read("engine.py")["source"] == (
+        f"git:{head}:engine.py"
+    )
+    with pytest.raises(ValueError):
+        RepositorySearch(str(git_repo), revision=blob)
 
 
 @pytest.mark.parametrize(
@@ -162,3 +217,109 @@ def test_regression_retrieval_charges_the_adopted_worker_budget(git_repo, tmp_pa
         assert original.calls == 0 and worker.budget.calls == 1
     finally:
         state.close()
+
+
+@pytest.mark.parametrize("name", ["Target.resolve", "pkg.engine.Target.resolve"])
+def test_qualified_symbol_selects_correct_owner_not_same_named_method(git_repo, name):
+    source = (
+        "class Decoy:\n    def resolve(self):\n        return 'wrong-owner'\n"
+        + "\n" * 35
+        + "class Target:\n    def resolve(self):\n        return 'correct-owner'\n"
+    )
+    commit(git_repo, **{"pkg/engine.py": source})
+    found = RepositorySearch(str(git_repo)).symbol(name, paths=("pkg/engine.py",))
+    assert [(row["relation"], row["symbol"], row["path"]) for row in found] == [
+        ("definition", name, "pkg/engine.py")]
+    assert "return 'correct-owner'" in found[0]["text"]
+    assert "wrong-owner" not in found[0]["text"]
+
+
+def test_scoped_grep_keeps_separate_matches_in_one_file_under_result_cap(git_repo):
+    source = ("def first_hook():\n    return 'first'\n" + "\n" * 40
+              + "def second_hook():\n    return 'second'\n" + "\n" * 40
+              + "def third_hook():\n    return 'third'\n")
+    commit(git_repo, **{"hooks.py": source})
+    search = RepositorySearch(str(git_repo))
+    found = search.grep("first_hook second_hook third_hook", paths=("hooks.py",),
+                        scoped=True, limit=2)
+    assert "def first_hook" in found[0]["text"] and "def second_hook" in found[1]["text"]
+    assert all("def third_hook" not in row["text"] for row in found)
+    for row in found:
+        assert row["text"] == "".join(source.splitlines(keepends=True)[
+            row["line_start"] - 1:row["line_end"]])
+
+
+def test_related_method_finds_actual_override_not_unrelated_same_name(git_repo):
+    source = (
+        "class Parent:\n"
+        "    def resolve(self):\n        return 'parent'\n\n"
+        "class Unrelated:\n"
+        "    def resolve(self):\n        return 'unrelated'\n\n"
+        "class Child(Parent):\n"
+        "    def resolve(self):\n        return 'child'\n"
+    )
+    commit(git_repo, **{"engine.py": source})
+    search = RepositorySearch(str(git_repo))
+    related = search.related("engine.py", 3)
+    assert [(row["symbol"], row["relation"]) for row in related] == [
+        ("Child.resolve", "overriding_definition"),
+    ]
+    assert "return 'child'" in related[0]["text"]
+    assert "return 'unrelated'" not in related[0]["text"]
+
+
+def test_related_consumer_traces_argument_producer_not_constructor_or_decoy(git_repo):
+    source = (
+        "class Engine:\n"
+        "    def setup(self):\n"
+        "        value = self.produce()\n"
+        "        return self.consume(value)\n"
+        "    def consume(self, value):\n        return value\n"
+        "    def produce(self):\n        return self.current_value\n"
+        "class Decoy:\n"
+        "    def produce(self):\n        return 'wrong owner'\n"
+    )
+    commit(git_repo, **{"engine.py": source})
+    related = RepositorySearch(str(git_repo)).related("engine.py", 5)
+    assert related[0]["symbol"] == "Engine.produce"
+    assert related[0]["relation"] == "argument_producer"
+    assert "return self.current_value" in related[0]["text"]
+    assert "wrong owner" not in related[0]["text"]
+
+
+def test_related_consumer_does_not_claim_stale_producer_after_conditional_write(git_repo):
+    source = (
+        "class Engine:\n"
+        "    def setup(self, flag):\n"
+        "        value = self.old()\n"
+        "        if flag:\n"
+        "            value = self.new()\n"
+        "            return self.consume(value)\n"
+        "    def consume(self, value):\n        return value\n"
+        "    def old(self):\n        return 'old'\n"
+        "    def new(self):\n        return 'new'\n"
+    )
+    commit(git_repo, **{"engine.py": source})
+    related = RepositorySearch(str(git_repo)).related("engine.py", 7, limit=2)
+    assert all(row["symbol"] != "Engine.old" for row in related)
+    assert related[0]["symbol"] == "Engine.setup" and related[0]["relation"] == "local_caller"
+
+
+def test_setup_variant_does_not_merge_different_factories_or_rebound_factory(git_repo):
+    source = (
+        "class Contract:\n"
+        "    def test_default(self):\n"
+        "        Case = factory('first')\n"
+        "        value = Case()\n"
+        "    def test_different(self):\n"
+        "        Case = factory('second')\n"
+        "        value = Case({'data': 1})\n"
+        "    def test_rebound(self):\n"
+        "        Case = factory('first')\n"
+        "        Case = other_factory()\n"
+        "        value = Case({'data': 1})\n"
+    )
+    commit(git_repo, **{"contracts.py": source})
+    search = RepositorySearch(str(git_repo))
+    assert search.enclosing_symbol("contracts.py", 4) == "Contract.test_default"
+    assert all(row["relation"] != "setup_variant" for row in search.related("contracts.py", 2))
