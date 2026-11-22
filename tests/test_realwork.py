@@ -2,7 +2,6 @@
 import json
 import io
 from pathlib import Path
-import sys
 import zipfile
 from types import SimpleNamespace
 import time
@@ -37,14 +36,11 @@ def test_hidden_upstream_patch_is_absent_until_independent_evaluation(
     task_path.write_text(json.dumps(task))
     monkeypatch.setattr(realwork,"PROJECT",tmp_path)
     monkeypatch.setattr(realwork,"DATA",data)
-    monkeypatch.setattr(realwork,"test_command",lambda row:[sys.executable,"upstream_tests.py"])
+    monkeypatch.setattr(realwork,"test_command",lambda row:["python3","upstream_tests.py"])
     row = {"case":"issue", "upstream_root":"upstream", "targets":["solution.py"]}
     if include_reproduction:
         row["public_reproduction"] = {"statement":"value must be two",
                                      "code":"from solution import value\nassert value() == 2\n"}
-        # The fixed interpreter path is operator-owned; no additional dependency is installed.
-        (data / "env/bin").mkdir(parents=True)
-        (data / "env/bin/python").symlink_to(sys.executable)
     root = tmp_path / "trial"
     root.mkdir()
     repo,bundle,tree,frozen = realwork._setup(row,root,30000)
@@ -341,7 +337,7 @@ def known_task_replay(tmp_path, monkeypatch):
     monkeypatch.setattr(realwork, "PROJECT", project)
     monkeypatch.setattr(realwork, "DATA", data)
     monkeypatch.setattr(realwork, "test_command",
-                        lambda row, **kwargs: [sys.executable, "upstream_tests.py"])
+                        lambda row, **kwargs: ["python3", "upstream_tests.py"])
     context = {
         "study": "known-task-development-replay-v1", "phase": "known-task-replay",
         "plan_sha256": "a" * 64, "comparison_job_id": "historical_compact",

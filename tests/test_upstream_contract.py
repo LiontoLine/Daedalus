@@ -42,10 +42,9 @@ def test_reference_fix_can_pass_public_and_hidden_when_old_expectation_changes(t
     data = tmp_path / "data"
     (data / "tasks/issue").mkdir(parents=True)
     (data / "tasks/issue/task.json").write_text(json.dumps(task))
-    (data / "env/bin").mkdir(parents=True)
-    (data / "env/bin/python").symlink_to(sys.executable)
     monkeypatch.setattr(realwork,"PROJECT",tmp_path)
     monkeypatch.setattr(realwork,"DATA",data)
+    monkeypatch.setattr(realwork, "_native_python", lambda: "python3")
     contract = compile_contract(task,["mytests"],source)
     row = {"case":"issue", "repo":"django/django", "labels":["mytests"],
            "upstream_root":"upstream", "targets":["solution.py"], "test_contract":contract}

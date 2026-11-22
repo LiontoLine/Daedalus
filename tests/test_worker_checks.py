@@ -2,7 +2,6 @@
 
 import json
 import shlex
-import sys
 import time
 from dataclasses import replace
 
@@ -21,7 +20,7 @@ from tests.conftest import CORRECT_IMPLEMENTATION, TARGET
 
 
 def python_command(source):
-    return shlex.join([sys.executable, "-B", "-c", source])
+    return shlex.join(["python3", "-B", "-c", source])
 
 
 COMMAND = python_command(

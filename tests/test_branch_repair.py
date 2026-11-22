@@ -174,10 +174,10 @@ def test_frozen_preservation_requires_a_settled_counterexample_to_retry_same_own
     git_repo, tmp_path, interrupted, prior_unmet,
 ):
     from daedalus.application.requirement_evidence import bind_bundle, qualify, seal
-    from daedalus.infrastructure.sandbox import HostProcessDriver
 
     owner = owner_for(git_repo, tmp_path, "frozen-regression")
-    boundary = replace(owner.bundle.boundary, isolation="host-process")
+    driver = owner.isolation.driver
+    boundary = replace(owner.bundle.boundary, isolation=driver.name)
     owner.bundle = replace(owner.bundle, boundary=boundary)
     changed_path, marker = ("b.py", "new") if prior_unmet else ("c.py", "C_OK")
     invariant = ("raise RuntimeError('private verifier interruption')" if interrupted
@@ -204,7 +204,7 @@ class RequirementTests(unittest.TestCase):
 """,
     })
     proof = qualify(git_repo, contract, list(boundary.fs_whitelist), boundary,
-                    tmp_path / "frozen-baseline", driver=HostProcessDriver())
+                    tmp_path / "frozen-baseline", driver=driver)
     owner.bundle = bind_bundle(owner.bundle, contract, proof)
     criterion = owner.bundle.goal.acceptance_criteria[-1]
     if prior_unmet:

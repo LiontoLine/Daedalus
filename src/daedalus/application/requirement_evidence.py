@@ -154,12 +154,15 @@ def validate_contract(contract: dict) -> None:
                           where="operator behavior contract")
 
 
-def run_checks(sandbox: GitSandbox, contract: dict, boundary: BoundarySpec, *, run) -> tuple:
+def run_checks(sandbox: GitSandbox, contract: dict, boundary: BoundarySpec, *,
+               run, driver_name: str = "") -> tuple:
     """Execute the controller's suite; bind the receipt to the exact tested tree."""
     validate_contract(contract)
     before, head = sandbox.tree_digest(), sandbox.head()
     names = [c["test_name"] for c in contract["checks"]]
-    command = [sys.executable, "-B", "-I", "-c", render_behavior_verifier(
+    # A container cannot see the controller's virtualenv or absolute interpreter path.
+    python = "python3" if driver_name == "container" else sys.executable
+    command = [python, "-B", "-I", "-c", render_behavior_verifier(
         contract["source"], names, contract["sha256"])]
     result = run(sandbox, command, timeout_sec=min(boundary.max_runtime_sec, 30))
     failure_code = result.failure_code
@@ -223,7 +226,8 @@ def qualify(repo: Path, contract: dict, targets: list[str], boundary: BoundarySp
             def run(sandbox, command, *, timeout_sec):
                 return driver.run(worktree=sandbox.worktree_path, command=command,
                     boundary=boundary, timeout_sec=timeout_sec).to_command_result()
-            receipt, execution = run_checks(box, contract, boundary, run=run)
+            receipt, execution = run_checks(box, contract, boundary, run=run,
+                                            driver_name=driver.name)
             result.update(baseline=receipt, decision=classify(contract, receipt),
                           diagnostic=redact_text(execution.combined(1800)))
         except (OSError, ValueError, KeyError, TypeError):
@@ -401,7 +405,8 @@ def is_behavior(criterion: AcceptanceCriterion) -> bool:
 
 
 def execute_criterion(sandbox: GitSandbox, criterion: AcceptanceCriterion,
-                      boundary: BoundarySpec, objective: str, *, run) -> tuple:
+                      boundary: BoundarySpec, objective: str, *, run,
+                      driver_name: str = "") -> tuple:
     try:
         contract = criterion.expect["behavior_contract"]
         proof = criterion.expect["baseline_qualification"]
@@ -416,7 +421,7 @@ def execute_criterion(sandbox: GitSandbox, criterion: AcceptanceCriterion,
         if not _git(sandbox.worktree_path, ["merge-base", "--is-ancestor", proof["base_commit"],
                                           sandbox.head()], check=False).ok:
             raise ValueError("candidate is not derived from the qualified baseline")
-        receipt, result = run_checks(sandbox, contract, boundary, run=run)
+        receipt, result = run_checks(sandbox, contract, boundary, run=run, driver_name=driver_name)
         evidence = {"criterion_digest": digest_of(criterion.to_dict()),
                     "contract_digest": contract["sha256"], "baseline_commit": proof["base_commit"],
                     "requirement_checks": contract["checks"], "receipt": receipt}

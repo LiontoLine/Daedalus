@@ -474,7 +474,8 @@ class Tier1Gate:
 
         if is_behavior(criterion):
             return execute_criterion(
-                sandbox, criterion, self.boundary, self.goal.objective, run=self._run)
+                sandbox, criterion, self.boundary, self.goal.objective, run=self._run,
+                driver_name=self.driver.name if self.driver is not None else "")
         return self._run_criterion(sandbox, criterion), {}
 
     def _check_acceptance(
@@ -489,10 +490,7 @@ class Tier1Gate:
         criteria, source = self._criteria()
 
         for criterion in criteria:
-            from daedalus.application.requirement_evidence import (
-                execute_criterion,
-                is_behavior,
-            )
+            from daedalus.application.requirement_evidence import is_behavior
             behavior = is_behavior(criterion)
             if criterion.kind is AssertionKind.NATURAL_LANGUAGE and not behavior:
                 executed.append(
@@ -504,8 +502,7 @@ class Tier1Gate:
             runner = overrides.get(criterion.criterion_id)
             if behavior:
                 # Controller-owned evidence cannot be replaced by an acceptance override.
-                result, behavior_evidence = execute_criterion(
-                    sandbox, criterion, self.boundary, self.goal.objective, run=self._run)
+                result, behavior_evidence = self.run_declared_criterion(sandbox, criterion)
             elif runner is not None:
                 result = runner(sandbox)
             else:

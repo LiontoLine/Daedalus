@@ -47,8 +47,12 @@ def catalog():
     return json.loads(path.read_text()) if path.exists() else []
 
 
+def _native_python() -> str:
+    return str(DATA / "env/bin/python")
+
+
 def test_command(row, *, hidden=False):
-    python = str(DATA / "env/bin/python")
+    python = _native_python()
     contract = row.get("test_contract")
     if contract:
         from daedalus.application.upstream_contract import validate_contract
@@ -103,14 +107,15 @@ def _setup(row, root, max_tokens):
     if row.get("public_reproduction"):
         reproduction = row["public_reproduction"]
         (repo / "verify_issue.py").write_text(reproduction["code"])
+        issue_command = [command[0], "verify_issue.py"]
         wrapper = (render_native_verifier(
             command,row["repo"],expected_tests=count,
-            followup=[str(DATA / 'env/bin/python'), 'verify_issue.py'],immutable_files=immutable
+            followup=issue_command,immutable_files=immutable
         ) if row.get("test_contract") else wrapper.replace(
             f"sys.exit(subprocess.run({command!r},cwd=root,env=env).returncode)",
             f"regression=subprocess.run({command!r},cwd=root,env=env).returncode\n"
             "if regression: sys.exit(regression)\n"
-            f"sys.exit(subprocess.run({[str(DATA / 'env/bin/python'), 'verify_issue.py']!r},cwd=root,env=env).returncode)"
+            f"sys.exit(subprocess.run({issue_command!r},cwd=root,env=env).returncode)"
         ))
         (repo / "verify_public.py").write_text(wrapper)
     with (repo / ".gitignore").open("a") as stream:
